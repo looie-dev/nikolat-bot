@@ -84,7 +84,7 @@ class RiskManager:
         if balance <= 0:
             return RiskDecision(False, 0.0, 0.0, "Số dư tài khoản <= 0")
 
-        if open_positions_count >= self.max_open_positions:
+        if self.max_open_positions > 0 and open_positions_count >= self.max_open_positions:
             return RiskDecision(
                 False,
                 0.0,

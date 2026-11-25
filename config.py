@@ -123,7 +123,7 @@ STRATEGY_PRESETS: Dict[str, StrategyConfig] = {
 @dataclass(frozen=True)
 class RiskConfig:
     risk_percent: float = 1.0
-    max_open_positions: int = 1
+    max_open_positions: int = 2
     max_daily_trades: int = 0
     max_daily_loss_percent: float = 3.0
     max_spread_usd: float = 0.60
@@ -132,6 +132,8 @@ class RiskConfig:
     allow_opposite_positions: bool = False
     fixed_size: float = 0.0
     max_size: float = 0.0
+    max_positions_per_mode: int = 1
+    exit_alert_min_minutes: int = 0
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,7 @@ class BotConfig:
     dry_run: bool = False
     log_level: str = "INFO"
     strategy_profiles: Tuple[StrategyProfile, ...] = ()
+    manual_confirm_tracking: bool = False
 
     @property
     def active_profiles(self) -> Tuple[StrategyProfile, ...]:
@@ -220,7 +223,7 @@ def load_config(env_path: str = ".env") -> BotConfig:
         profiles = tuple(parsed)
     risk = RiskConfig(
         risk_percent=_env_float("RISK_PERCENT", 1.0),
-        max_open_positions=_env_int("MAX_OPEN_POSITIONS", 1),
+        max_open_positions=_env_int("MAX_OPEN_POSITIONS", 2),
         max_daily_trades=_env_int("MAX_DAILY_TRADES", 0),
         max_daily_loss_percent=_env_float("MAX_DAILY_LOSS_PERCENT", 3.0),
         max_spread_usd=_env_float("MAX_SPREAD_USD", 0.60),
@@ -229,6 +232,8 @@ def load_config(env_path: str = ".env") -> BotConfig:
         allow_opposite_positions=_env_bool("ALLOW_OPPOSITE_POSITIONS", False),
         fixed_size=_env_float("FIXED_SIZE", 0.0),
         max_size=_env_float("MAX_SIZE", 0.0),
+        max_positions_per_mode=_env_int("MAX_POSITIONS_PER_MODE", 1),
+        exit_alert_min_minutes=_env_int("EXIT_ALERT_MIN_MINUTES", 0),
     )
     broker = BrokerConfig(
         provider=os.environ.get("BROKER_PROVIDER", "paper").strip().lower(),
@@ -264,4 +269,5 @@ def load_config(env_path: str = ".env") -> BotConfig:
         dry_run=_env_bool("DRY_RUN", False),
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         strategy_profiles=profiles,
+        manual_confirm_tracking=_env_bool("MANUAL_CONFIRM_TRACKING", True),
     )

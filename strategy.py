@@ -21,6 +21,13 @@ class TradeSignal:
     indicators: Dict[str, float]
 
 
+@dataclass(frozen=True)
+class TradeAdvice:
+    action: str  # "close_now", "move_sl_be", or "lock_profit"
+    suggested_sl: Optional[float]
+    reason: str
+
+
 @dataclass
 class IndicatorCache:
     ema_fast: List[float]
@@ -213,3 +220,92 @@ class TrendPullbackStrategy:
             return None
         cache = compute_indicators(candles, self.cfg)
         return self.evaluate_at(candles, len(candles) - 1, cache)
+
+
+def evaluate_trade_management(
+    side: str,
+    entry_price: float,
+    current_sl: Optional[float],
+    take_profit: Optional[float],
+    max_favorable_price: float,
+    candles: Sequence[Dict[str, Any]],
+    cfg: StrategyConfig,
+    be_done: bool = False,
+    lock_done: bool = False,
+) -> Optional[TradeAdvice]:
+    """
+    Observe an open trade on each closed candle and suggest:
+      - close_now: structure & momentum broke against the trade
+      - lock_profit: reached >=75% TP and stalling -> lock +45% TP
+      - move_sl_be: reached >=50% TP and stalling -> move SL to breakeven (+$0.50 spread buffer)
+    """
+    min_bars = max(cfg.ema_slow + 5, 60)
+    if len(candles) < min_bars:
+        return None
+    cache = compute_indicators(candles, cfg)
+    idx = len(candles) - 1
+    c = candles[idx]
+    open_p = float(c["open"])
+    close_p = float(c["close"])
+    ema_f = cache.ema_fast[idx]
+    rsi = cache.rsi[idx]
+    macd_l = cache.macd_line[idx]
+    macd_s = cache.macd_signal[idx]
+    macd_h = cache.macd_hist[idx]
+    macd_h_prev = cache.macd_hist[idx - 1]
+    is_buy = side.upper() == "BUY"
+
+    # 1. Trend structure broken -> close early
+    if is_buy and close_p < ema_f and macd_l < macd_s and macd_h < 0.0 and rsi < 45.0:
+        return TradeAdvice("close_now", None, f"Gãy EMA{cfg.ema_fast}, MACD âm, RSI={rsi:.1f}")
+    if not is_buy and close_p > ema_f and macd_l > macd_s and macd_h > 0.0 and rsi > 55.0:
+        return TradeAdvice("close_now", None, f"Vượt EMA{cfg.ema_fast}, MACD dương, RSI={rsi:.1f}")
+
+    if take_profit is None:
+        return None
+    tp_dist = abs(take_profit - entry_price)
+    if tp_dist <= 0:
+        return None
+
+    mfe_frac = (
+        (max_favorable_price - entry_price) / tp_dist
+        if is_buy
+        else (entry_price - max_favorable_price) / tp_dist
+    )
+    stalling = (
+        (macd_h < macd_h_prev and close_p < open_p)
+        if is_buy
+        else (macd_h > macd_h_prev and close_p > open_p)
+    )
+    if not stalling:
+        return None
+
+    # 2. >= 75% TP reached and stalling -> lock +45% TP
+    if not lock_done and mfe_frac >= 0.75:
+        new_sl = round(entry_price + 0.45 * tp_dist, 2) if is_buy else round(entry_price - 0.45 * tp_dist, 2)
+        safer = current_sl is None or (new_sl > current_sl if is_buy else new_sl < current_sl)
+        still_valid = close_p > new_sl if is_buy else close_p < new_sl
+        if safer and still_valid:
+            return TradeAdvice("lock_profit", new_sl, f"Đã đạt {int(mfe_frac * 100)}% TP và nến có dấu hiệu hụt hơi")
+
+    # 3. >= 50% TP reached and stalling -> move SL to breakeven + $0.50 spread buffer
+    if not be_done and mfe_frac >= 0.50:
+        new_sl = round(entry_price + 0.50, 2) if is_buy else round(entry_price - 0.50, 2)
+        safer = current_sl is None or (new_sl > current_sl if is_buy else new_sl < current_sl)
+        still_valid = close_p > new_sl if is_buy else close_p < new_sl
+        if safer and still_valid:
+            return TradeAdvice("move_sl_be", new_sl, f"Đã đạt {int(mfe_frac * 100)}% TP và động lượng đang chững lại")
+
+    return None
+
+
+def evaluate_early_exit(
+    side: str,
+    candles: Sequence[Dict[str, Any]],
+    cfg: StrategyConfig,
+) -> Optional[str]:
+    """Backwards-compatible helper returning exit reason when structure breaks."""
+    adv = evaluate_trade_management(side, 0.0, None, None, 0.0, candles, cfg)
+    if adv and adv.action == "close_now":
+        return adv.reason
+    return None

@@ -20,7 +20,7 @@ from config import BotConfig, BrokerConfig, RiskConfig, StrategyConfig, Strategy
 from health_server import build_health_response, start_health_server
 from indicators import adx_series, atr_series, ema_series, macd_series, rsi_series
 from news_filter import NewsEvent, NewsFilter
-from notifier import TelegramNotifier
+from notifier import TelegramNotifier, TelegramUserAction, parse_telegram_text_command
 from risk_manager import InstrumentSpec, RiskManager
 from strategy import TradeSignal, TrendPullbackStrategy
 
@@ -272,8 +272,8 @@ class TestRiskAndNews(unittest.TestCase):
 
     def test_telegram_buy_now_message_format(self):
         notifier = TelegramNotifier(TelegramConfig(bot_token="tok", chat_id="123"))
-        sent_texts = []
-        notifier.send_message = lambda text: (sent_texts.append(text) or True)
+        sent_payloads = []
+        notifier.send_message_with_id = lambda text, reply_markup=None: (sent_payloads.append((text, reply_markup)) or 999)
         sig = TradeSignal(
             side="BUY",
             entry_price=3500.0,
@@ -285,7 +285,7 @@ class TestRiskAndNews(unittest.TestCase):
             reason="Test",
             indicators={"ema50": 3495.0, "ema200": 3480.0, "rsi": 52.0, "adx": 22.0, "atr": 8.0},
         )
-        notifier.notify_order_opened(
+        msg_id = notifier.notify_order_opened(
             signal=sig,
             size=0.01,
             risk_usd=8.0,
@@ -293,9 +293,11 @@ class TestRiskAndNews(unittest.TestCase):
             order_id="PAPER-1",
             balance=100.0,
             mode_label="M5_SCALP",
+            confirm_id="M5_SCALP-1",
         )
-        self.assertEqual(len(sent_texts), 1)
-        body = sent_texts[0]
+        self.assertEqual(msg_id, 999)
+        self.assertEqual(len(sent_payloads), 1)
+        body, markup = sent_payloads[0]
         self.assertIn("BUY NOW", body)
         self.assertIn("M5_SCALP", body)
         self.assertIn("<code>3492.00</code>", body)
@@ -303,6 +305,9 @@ class TestRiskAndNews(unittest.TestCase):
         self.assertIn("3498.00 – 3504.00", body)
         self.assertNotIn("Chỉ báo", body)
         self.assertNotIn("Nến (VN)", body)
+        self.assertEqual(markup["inline_keyboard"][0][0]["text"], "✅")
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "enter:M5_SCALP-1")
+        self.assertEqual(len(markup["inline_keyboard"][0]), 1)
 
 
 class TestBrokersAndBotLoop(unittest.TestCase):
@@ -574,6 +579,273 @@ class TestBrokersAndBotLoop(unittest.TestCase):
             # 22:00 VN (15:00 UTC) -> should NOT send
             self.assertFalse(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 15, 0, tzinfo=timezone.utc)))
             self.assertEqual(notifier.notify_status.call_count, 4)
+
+    def test_unlimited_positions_per_mode_and_early_exit_alert_after_10m(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bull_candles = TestStrategy._build_bull_pullback_candles()
+            candles = list(bull_candles)
+
+            b_cfg = BrokerConfig(
+                provider="paper",
+                paper_initial_balance=100.0,
+                paper_contract_size=100.0,
+                paper_state_file=str(Path(tmpdir) / "paper.json"),
+            )
+            broker = PaperBroker(b_cfg, candle_fetcher=lambda tf, cnt: candles)
+            notifier = MagicMock()
+            nf = NewsFilter(buffer_minutes=15)
+            nf.set_events_for_test([])
+
+            prof = StrategyProfile(
+                name="M5_SCALP",
+                strategy=StrategyConfig(
+                    timeframe="M5", ema_fast=50, ema_slow=200, adx_min=0.0,
+                    pullback_lookback=6, pullback_atr_tolerance=0.6,
+                    rsi_buy_min=40.0, rsi_buy_max=72.0, sl_atr_mult=1.2, rr_ratio=1.7,
+                    use_session_filter=True,
+                ),
+            )
+            bot_cfg = BotConfig(
+                strategy=prof.strategy,
+                risk=RiskConfig(
+                    risk_percent=10.0, max_open_positions=0, max_positions_per_mode=0,
+                    max_spread_usd=1.0, cooldown_candles=0, exit_alert_min_minutes=0,
+                ),
+                broker=b_cfg,
+                telegram=TelegramConfig(bot_token="x", chat_id="y"),
+                strategy_profiles=(prof,),
+            )
+            bot = TradingBot(bot_cfg, broker=broker, notifier=notifier, news_filter=nf)
+            bot.initialize()
+
+            # Trade 1 opens
+            sig1 = bot.run_once()
+            self.assertIsNotNone(sig1)
+            self.assertEqual(len(broker.get_open_positions()), 1)
+
+            # Append another bullish signal sequence -> opens 2nd position when max_positions_per_mode=0
+            candles2 = TestStrategy._build_bull_pullback_candles()
+            candles2[-1]["time"] = candles[-1]["time"] + 300
+            candles[:] = candles2
+            sig2 = bot.run_once()
+            self.assertIsNotNone(sig2)
+            self.assertEqual(len(broker.get_open_positions()), 2)
+
+            # Verify max_positions_per_mode=1 blocks a 2nd signal from the same mode
+            bot.cfg = BotConfig(
+                strategy=prof.strategy,
+                risk=RiskConfig(
+                    risk_percent=10.0, max_open_positions=2, max_positions_per_mode=1,
+                    max_spread_usd=1.0, cooldown_candles=0, exit_alert_min_minutes=0,
+                ),
+                broker=b_cfg,
+                telegram=TelegramConfig(bot_token="x", chat_id="y"),
+                strategy_profiles=(prof,),
+            )
+            candles3 = TestStrategy._build_bull_pullback_candles()
+            candles3[-1]["time"] = candles[-1]["time"] + 300
+            candles[:] = candles3
+            self.assertIsNone(bot.run_once())
+            self.assertEqual(len(broker.get_open_positions()), 2)
+
+            # Simulate price rallying >= 60% TP and then printing a stalling red candle above breakeven
+            pos1 = broker.get_open_positions()[0]
+            tp_dist = abs(pos1.take_profit - pos1.entry_price)
+            push_t = candles[-1]["time"]
+            for k in (1, 2):
+                candles.append({
+                    "time": push_t + k * 300,
+                    "open": candles[-1]["close"],
+                    "high": candles[-1]["close"] + tp_dist * 0.35,
+                    "low": candles[-1]["close"] - 0.5,
+                    "close": candles[-1]["close"] + tp_dist * 0.32,
+                    "volume": 100.0,
+                })
+            # Mild 2-candle pullback staying well above entry + $0.50 so MACD hist genuinely shrinks
+            for k in (3, 4):
+                candles.append({
+                    "time": push_t + k * 300,
+                    "open": candles[-1]["close"],
+                    "high": candles[-1]["close"] + 0.1,
+                    "low": candles[-1]["close"] - 2.0,
+                    "close": candles[-1]["close"] - 1.5,
+                    "volume": 100.0,
+                })
+            bot._last_exit_check_candle_time = None
+            bot._check_early_exits({"M5": candles}, candles[-1]["close"])
+            self.assertEqual(notifier.notify_move_sl_advice.call_count, 2)
+
+            # Now simulate deep reversal breaking EMA50, MACD < 0, RSI < 45 -> sends close warning
+            rev_start = candles[-1]["time"] + 300
+            for k in range(1, 16):
+                candles.append({
+                    "time": rev_start + k * 300,
+                    "open": candles[-1]["close"],
+                    "high": candles[-1]["close"] + 0.5,
+                    "low": candles[-1]["close"] - 4.0,
+                    "close": candles[-1]["close"] - 3.5,
+                    "volume": 100.0,
+                })
+
+            bot._last_exit_check_candle_time = None
+            bot._check_early_exits({"M5": candles}, candles[-1]["close"])
+            self.assertEqual(notifier.notify_close_warning.call_count, 2)
+
+    def test_manual_confirm_via_telegram_reply_and_button(self):
+        self.assertEqual(parse_telegram_text_command("vào"), ("enter", None))
+        self.assertEqual(parse_telegram_text_command("Vào 3501.25"), ("enter", 3501.25))
+        self.assertEqual(parse_telegram_text_command("bỏ qua"), ("skip", None))
+        self.assertEqual(parse_telegram_text_command("đóng 3510.5"), ("close", 3510.5))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            candles = list(TestStrategy._build_bull_pullback_candles())
+            b_cfg = BrokerConfig(
+                provider="paper",
+                paper_initial_balance=100.0,
+                paper_contract_size=100.0,
+                paper_state_file=str(Path(tmpdir) / "paper.json"),
+            )
+            broker = PaperBroker(b_cfg, candle_fetcher=lambda tf, cnt: candles)
+            notifier = MagicMock()
+            notifier.get_latest_update_offset.return_value = 10
+            notifier.notify_order_opened.return_value = 501
+            notifier.notify_tracking_confirmed.return_value = 502
+            notifier.poll_updates.return_value = ([], 10)
+            nf = NewsFilter(buffer_minutes=15)
+            nf.set_events_for_test([])
+
+            prof = StrategyProfile(
+                name="M5_SCALP",
+                strategy=StrategyConfig(
+                    timeframe="M5", ema_fast=50, ema_slow=200, adx_min=0.0,
+                    pullback_lookback=6, pullback_atr_tolerance=0.6,
+                    rsi_buy_min=40.0, rsi_buy_max=72.0, sl_atr_mult=1.2, rr_ratio=1.7,
+                    use_session_filter=True,
+                ),
+            )
+            bot_cfg = BotConfig(
+                strategy=prof.strategy,
+                risk=RiskConfig(
+                    risk_percent=10.0, max_open_positions=2, max_positions_per_mode=1,
+                    max_spread_usd=1.0, cooldown_candles=0,
+                ),
+                broker=b_cfg,
+                telegram=TelegramConfig(bot_token="x", chat_id="y"),
+                strategy_profiles=(prof,),
+                manual_confirm_tracking=True,
+            )
+            bot = TradingBot(bot_cfg, broker=broker, notifier=notifier, news_filter=nf)
+            bot.initialize()
+
+            # Signal fires -> sent to Telegram with confirm buttons, NOT tracked yet
+            sig = bot.run_once()
+            self.assertIsNotNone(sig)
+            self.assertEqual(len(broker.get_open_positions()), 0)
+            self.assertEqual(len(bot._pending_confirmations), 1)
+
+            # User replies "vào 2146.00" to message 501 -> starts tracking with entry 2146.00
+            notifier.poll_updates.return_value = (
+                [TelegramUserAction(action="enter", reply_to_message_id=501, custom_price=2146.00)],
+                11,
+            )
+            bot.run_once()
+            positions = broker.get_open_positions()
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0].entry_price, 2146.00)
+            notifier.notify_tracking_confirmed.assert_called_once()
+
+            # User replies "đóng 2152.00" to confirmation message 502 -> closes tracked trade
+            notifier.poll_updates.return_value = (
+                [TelegramUserAction(action="close", reply_to_message_id=502, custom_price=2152.00)],
+                12,
+            )
+            bot.run_once()
+            self.assertEqual(len(broker.get_open_positions()), 0)
+            notifier.notify_position_closed.assert_called_once()
+
+            # Subsequent candle does NOT duplicate close warning for already-alerted positions
+            candles.append({
+                "time": candles[-1]["time"] + 300,
+                "open": candles[-1]["close"],
+                "high": candles[-1]["close"] + 0.5,
+                "low": candles[-1]["close"] - 2.0,
+                "close": candles[-1]["close"] - 1.5,
+                "volume": 100.0,
+            })
+            bot._check_early_exits({"M5": candles}, candles[-1]["close"])
+            self.assertEqual(notifier.notify_close_warning.call_count, 2)
+
+    def test_manual_confirm_via_telegram_reply_and_button(self):
+        self.assertEqual(parse_telegram_text_command("vào"), ("enter", None))
+        self.assertEqual(parse_telegram_text_command("Vào 3501.25"), ("enter", 3501.25))
+        self.assertEqual(parse_telegram_text_command("bỏ qua"), ("skip", None))
+        self.assertEqual(parse_telegram_text_command("đóng 3510.5"), ("close", 3510.5))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            candles = list(TestStrategy._build_bull_pullback_candles())
+            b_cfg = BrokerConfig(
+                provider="paper",
+                paper_initial_balance=100.0,
+                paper_contract_size=100.0,
+                paper_state_file=str(Path(tmpdir) / "paper.json"),
+            )
+            broker = PaperBroker(b_cfg, candle_fetcher=lambda tf, cnt: candles)
+            notifier = MagicMock()
+            notifier.get_latest_update_offset.return_value = 10
+            notifier.notify_order_opened.return_value = 501
+            notifier.notify_tracking_confirmed.return_value = 502
+            notifier.poll_updates.return_value = ([], 10)
+            nf = NewsFilter(buffer_minutes=15)
+            nf.set_events_for_test([])
+
+            prof = StrategyProfile(
+                name="M5_SCALP",
+                strategy=StrategyConfig(
+                    timeframe="M5", ema_fast=50, ema_slow=200, adx_min=0.0,
+                    pullback_lookback=6, pullback_atr_tolerance=0.6,
+                    rsi_buy_min=40.0, rsi_buy_max=72.0, sl_atr_mult=1.2, rr_ratio=1.7,
+                    use_session_filter=True,
+                ),
+            )
+            bot_cfg = BotConfig(
+                strategy=prof.strategy,
+                risk=RiskConfig(
+                    risk_percent=10.0, max_open_positions=2, max_positions_per_mode=1,
+                    max_spread_usd=1.0, cooldown_candles=0,
+                ),
+                broker=b_cfg,
+                telegram=TelegramConfig(bot_token="x", chat_id="y"),
+                strategy_profiles=(prof,),
+                manual_confirm_tracking=True,
+            )
+            bot = TradingBot(bot_cfg, broker=broker, notifier=notifier, news_filter=nf)
+            bot.initialize()
+
+            # Signal fires -> sent to Telegram with confirm buttons, NOT tracked yet
+            sig = bot.run_once()
+            self.assertIsNotNone(sig)
+            self.assertEqual(len(broker.get_open_positions()), 0)
+            self.assertEqual(len(bot._pending_confirmations), 1)
+
+            # User replies "vào 2146.00" to message 501 -> starts tracking with entry 2146.00
+            notifier.poll_updates.return_value = (
+                [TelegramUserAction(action="enter", reply_to_message_id=501, custom_price=2146.00)],
+                11,
+            )
+            bot.run_once()
+            positions = broker.get_open_positions()
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0].entry_price, 2146.00)
+            notifier.notify_tracking_confirmed.assert_called_once()
+
+            # User replies "đóng 2152.00" to confirmation message 502 -> closes tracked trade
+            notifier.poll_updates.return_value = (
+                [TelegramUserAction(action="close", reply_to_message_id=502, custom_price=2152.00)],
+                12,
+            )
+            bot.run_once()
+            self.assertEqual(len(broker.get_open_positions()), 0)
+            notifier.notify_position_closed.assert_called_once()
 
 
 if __name__ == "__main__":

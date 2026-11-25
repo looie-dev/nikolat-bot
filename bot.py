@@ -9,13 +9,13 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Set
 
-from brokers import BrokerClient, Position, create_broker
+from brokers import BrokerClient, PaperBroker, Position, create_broker
 from config import BotConfig, StrategyProfile, load_config
 from health_server import start_health_server
 from news_filter import NewsFilter
-from notifier import TelegramNotifier
+from notifier import TelegramNotifier, TelegramUserAction
 from risk_manager import RiskManager
-from strategy import TradeSignal, TrendPullbackStrategy
+from strategy import TradeSignal, TrendPullbackStrategy, evaluate_trade_management
 
 logger = logging.getLogger("xauusd_bot")
 
@@ -49,21 +49,38 @@ class TradingBot:
         )
         self._tracked_positions: Dict[str, Position] = {}
         self._position_modes: Dict[str, str] = {}
+        self._position_opened_at: Dict[str, int] = {}
+        self._position_opened_candle: Dict[str, int] = {}
+        self._position_mfe_price: Dict[str, float] = {}
+        self._position_exit_alerted: Set[str] = set()
+        self._position_be_alerted: Set[str] = set()
+        self._position_lock_alerted: Set[str] = set()
         self._last_evaluated_candle_time: Dict[str, int] = {}
+        self._last_exit_check_candle_time: Optional[int] = None
         self._candles_since_close: Dict[str, int] = {
             p.name: cfg.risk.cooldown_candles for p in self.profiles
         }
         self._last_atr: Dict[str, float] = {}
         self._last_status_time: float = 0.0
         self._sent_heartbeat_slots: Set[str] = set()
+        self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
+        self._msg_to_confirm: Dict[int, str] = {}
+        self._msg_to_position: Dict[int, str] = {}
+        self._tg_offset: int = 0
+        self._confirm_seq: int = 0
         self._running: bool = True
 
     def initialize(self) -> None:
         """Load initial broker state and send startup Telegram notification."""
         account = self.broker.get_account_summary()
+        now_sec = int(time.time())
         for pos in self.broker.get_open_positions():
             self._tracked_positions[pos.position_id] = pos
+            self._position_opened_at[pos.position_id] = now_sec
+            self._position_mfe_price[pos.position_id] = pos.entry_price
         self.news_filter.refresh(force=True)
+        if self.cfg.manual_confirm_tracking:
+            self._tg_offset = self.notifier.get_latest_update_offset()
         self._last_status_time = time.time()
         mode_summary = " + ".join(f"{p.name}({p.strategy.timeframe})" for p in self.profiles)
         logger.info(
@@ -97,6 +114,12 @@ class TradingBot:
             for pid in closed_ids:
                 prev = self._tracked_positions[pid]
                 mode_label = self._position_modes.pop(pid, "")
+                self._position_opened_at.pop(pid, None)
+                self._position_opened_candle.pop(pid, None)
+                self._position_mfe_price.pop(pid, None)
+                self._position_exit_alerted.discard(pid)
+                self._position_be_alerted.discard(pid)
+                self._position_lock_alerted.discard(pid)
                 if mode_label:
                     self._candles_since_close[mode_label] = 0
                 info = self.broker.get_closed_trade_info(pid)
@@ -184,9 +207,12 @@ class TradingBot:
         self._last_evaluated_candle_time[profile.name] = latest_candle_time
         self._candles_since_close[profile.name] = self._candles_since_close.get(profile.name, 0) + 1
 
-        # Avoid opening a second concurrent trade from the same mode
-        if profile.name in self._position_modes.values():
-            return None
+        # Respect per-mode open position cap only if configured (> 0)
+        per_mode_cap = self.cfg.risk.max_positions_per_mode
+        if per_mode_cap > 0:
+            mode_open_count = sum(1 for m in self._position_modes.values() if m == profile.name)
+            if mode_open_count >= per_mode_cap:
+                return None
 
         if self._candles_since_close[profile.name] <= self.cfg.risk.cooldown_candles:
             logger.debug(
@@ -250,6 +276,34 @@ class TradingBot:
             )
             return live_sig
 
+        if self.cfg.manual_confirm_tracking:
+            self._confirm_seq += 1
+            confirm_id = f"{profile.name}-{self._confirm_seq}"
+            msg_id = self.notifier.notify_order_opened(
+                signal=live_sig,
+                size=decision.size,
+                risk_usd=decision.risk_usd,
+                spread_usd=quote_spread,
+                order_id="CHỜ XÁC NHẬN",
+                balance=account.balance,
+                dry_run=False,
+                mode_label=profile.name,
+                confirm_id=confirm_id,
+            )
+            self._pending_confirmations[confirm_id] = {
+                "signal": live_sig,
+                "size": decision.size,
+                "risk_usd": decision.risk_usd,
+                "spread": quote_spread,
+                "mode": profile.name,
+                "msg_id": msg_id,
+                "created_at": int(time.time()),
+            }
+            if msg_id:
+                self._msg_to_confirm[msg_id] = confirm_id
+            logger.info("[%s] Sent signal %s waiting for Telegram confirmation", profile.name, confirm_id)
+            return live_sig
+
         result = self.broker.place_market_order(
             side=live_sig.side,
             size=decision.size,
@@ -259,6 +313,10 @@ class TradingBot:
         if result.success:
             self.risk_manager.record_trade_opened(account.balance)
             self._position_modes[result.order_id] = profile.name
+            self._position_opened_at[result.order_id] = int(time.time())
+            self._position_opened_candle[result.order_id] = int(live_sig.candle_time)
+            fill_p = result.fill_price or live_sig.entry_price
+            self._position_mfe_price[result.order_id] = fill_p
             self._tracked_positions[result.order_id] = Position(
                 position_id=result.order_id,
                 side=live_sig.side,
@@ -302,8 +360,163 @@ class TradingBot:
         self.notifier.send_message(f"⚠️ <b>LỖI ĐẶT LỆNH [{profile.name}]:</b> {result.message}")
         return None
 
+    def _resolve_pending_id(self, act: TelegramUserAction) -> Optional[str]:
+        if act.target_id and act.target_id in self._pending_confirmations:
+            return act.target_id
+        if act.reply_to_message_id and act.reply_to_message_id in self._msg_to_confirm:
+            cid = self._msg_to_confirm[act.reply_to_message_id]
+            if cid in self._pending_confirmations:
+                return cid
+        if self._pending_confirmations:
+            return list(self._pending_confirmations.keys())[-1]
+        return None
+
+    def _resolve_position_id(self, act: TelegramUserAction) -> Optional[str]:
+        if act.target_id and act.target_id in self._tracked_positions:
+            return act.target_id
+        if act.reply_to_message_id and act.reply_to_message_id in self._msg_to_position:
+            pid = self._msg_to_position[act.reply_to_message_id]
+            if pid in self._tracked_positions:
+                return pid
+        if len(self._tracked_positions) == 1:
+            return next(iter(self._tracked_positions.keys()))
+        return None
+
+    def _process_telegram_actions(self, now_sec: Optional[int] = None) -> None:
+        if not self.cfg.manual_confirm_tracking:
+            return
+        now = int(now_sec if now_sec is not None else time.time())
+        # Expire unconfirmed signals older than 20 minutes (default skipped)
+        expired = [k for k, v in self._pending_confirmations.items() if now - v["created_at"] > 1200]
+        for k in expired:
+            item = self._pending_confirmations.pop(k)
+            if item.get("msg_id"):
+                self._msg_to_confirm.pop(item["msg_id"], None)
+                self.notifier.clear_inline_buttons(item["msg_id"])
+
+        actions, self._tg_offset = self.notifier.poll_updates(self._tg_offset)
+        for act in actions:
+            if act.action == "enter":
+                cid = self._resolve_pending_id(act)
+                if not cid:
+                    if act.callback_query_id:
+                        self.notifier.answer_callback_query(act.callback_query_id, "Tín hiệu đã hết hạn hoặc đã xử lý")
+                    continue
+                pending = self._pending_confirmations.pop(cid)
+                sig: TradeSignal = pending["signal"]
+                msg_id = pending.get("msg_id")
+                if msg_id:
+                    self._msg_to_confirm.pop(msg_id, None)
+                    self.notifier.clear_inline_buttons(msg_id)
+
+                entry_override = act.custom_price
+                if isinstance(self.broker, PaperBroker):
+                    result = self.broker.place_market_order(
+                        side=sig.side,
+                        size=pending["size"],
+                        stop_loss=sig.stop_loss,
+                        take_profit=sig.take_profit,
+                        entry_override=entry_override,
+                    )
+                else:
+                    result = self.broker.place_market_order(
+                        side=sig.side,
+                        size=pending["size"],
+                        stop_loss=sig.stop_loss,
+                        take_profit=sig.take_profit,
+                    )
+                if result.success:
+                    account = self.broker.get_account_summary()
+                    self.risk_manager.record_trade_opened(account.balance)
+                    fill_p = result.fill_price or entry_override or sig.entry_price
+                    mode_name = pending["mode"]
+                    self._position_modes[result.order_id] = mode_name
+                    self._position_opened_at[result.order_id] = now
+                    self._position_opened_candle[result.order_id] = int(sig.candle_time)
+                    self._position_mfe_price[result.order_id] = fill_p
+                    self._tracked_positions[result.order_id] = Position(
+                        position_id=result.order_id,
+                        side=sig.side,
+                        size=result.size,
+                        entry_price=fill_p,
+                        stop_loss=sig.stop_loss,
+                        take_profit=sig.take_profit,
+                        unrealized_pnl=0.0,
+                    )
+                    if act.callback_query_id:
+                        self.notifier.answer_callback_query(act.callback_query_id, "Đã ghi nhận vào lệnh!")
+                    conf_msg_id = self.notifier.notify_tracking_confirmed(
+                        side=sig.side,
+                        entry_price=fill_p,
+                        position_id=result.order_id,
+                        mode_label=mode_name,
+                    )
+                    if conf_msg_id:
+                        self._msg_to_position[conf_msg_id] = result.order_id
+                    if msg_id:
+                        self._msg_to_position[msg_id] = result.order_id
+                    logger.info("[%s] User confirmed trade entry %s @ %.2f", mode_name, result.order_id, fill_p)
+                else:
+                    if act.callback_query_id:
+                        self.notifier.answer_callback_query(act.callback_query_id, f"Lỗi: {result.message}")
+                    self.notifier.send_message(f"⚠️ Không ghi nhận được lệnh: {result.message}")
+
+            elif act.action == "skip":
+                cid = self._resolve_pending_id(act)
+                if cid:
+                    pending = self._pending_confirmations.pop(cid)
+                    msg_id = pending.get("msg_id")
+                    if msg_id:
+                        self._msg_to_confirm.pop(msg_id, None)
+                        self.notifier.clear_inline_buttons(msg_id)
+                if act.callback_query_id:
+                    self.notifier.answer_callback_query(act.callback_query_id, "Đã bỏ qua")
+                self.notifier.send_message("👌 Đã bỏ qua tín hiệu — bot sẽ không theo dõi lệnh này.")
+
+            elif act.action == "close":
+                pid = self._resolve_position_id(act)
+                if not pid:
+                    if act.callback_query_id:
+                        self.notifier.answer_callback_query(act.callback_query_id, "Không tìm thấy lệnh đang mở")
+                    continue
+                pos = self._tracked_positions.get(pid)
+                mode_label = self._position_modes.get(pid, "")
+                if isinstance(self.broker, PaperBroker):
+                    closed = self.broker.close_position(pid, close_price=act.custom_price, reason="Đóng thủ công qua Telegram")
+                    if closed:
+                        account = self.broker.get_account_summary()
+                        self.risk_manager.record_trade_closed(closed.realized_pnl, account.balance)
+                        self._tracked_positions.pop(pid, None)
+                        self._position_modes.pop(pid, None)
+                        self._position_opened_at.pop(pid, None)
+                        self._position_opened_candle.pop(pid, None)
+                        self._position_mfe_price.pop(pid, None)
+                        self._position_exit_alerted.discard(pid)
+                        self._position_be_alerted.discard(pid)
+                        self._position_lock_alerted.discard(pid)
+                        if act.callback_query_id:
+                            self.notifier.answer_callback_query(act.callback_query_id, "Đã đóng lệnh!")
+                        if act.reply_to_message_id:
+                            self.notifier.clear_inline_buttons(act.reply_to_message_id)
+                        self.notifier.notify_position_closed(
+                            side=pos.side if pos else "",
+                            entry_price=pos.entry_price if pos else 0.0,
+                            close_price=closed.close_price,
+                            pnl_usd=closed.realized_pnl,
+                            balance=account.balance,
+                            position_id=pid,
+                            reason=closed.reason,
+                            mode_label=mode_label,
+                        )
+                else:
+                    if act.callback_query_id:
+                        self.notifier.answer_callback_query(act.callback_query_id, "Đã dừng theo dõi")
+                    self._tracked_positions.pop(pid, None)
+                    self._position_modes.pop(pid, None)
+
     def run_once(self) -> Optional[TradeSignal]:
         """Run one polling cycle across all configured strategy modes."""
+        self._process_telegram_actions()
         candles_by_tf: Dict[str, List[Dict[str, Any]]] = {}
         for prof in self.profiles:
             tf = prof.strategy.timeframe
@@ -312,6 +525,8 @@ class TradingBot:
 
         quote = self.broker.get_quote()
         self._sync_positions(quote.mid)
+        self._update_mfe(quote.mid)
+        self._check_early_exits(candles_by_tf, quote.mid)
 
         triggered: Optional[TradeSignal] = None
         for prof in self.profiles:
@@ -328,6 +543,96 @@ class TradingBot:
 
         self._maybe_send_heartbeat(quote.mid, quote.spread)
         return triggered
+
+    def _update_mfe(self, current_price: float) -> None:
+        for pid, pos in self._tracked_positions.items():
+            prev_mfe = self._position_mfe_price.get(pid, pos.entry_price)
+            if pos.side == "BUY":
+                self._position_mfe_price[pid] = max(prev_mfe, current_price)
+            else:
+                self._position_mfe_price[pid] = min(prev_mfe, current_price)
+
+    def _check_early_exits(
+        self,
+        candles_by_tf: Dict[str, List[Dict[str, Any]]],
+        current_price: float,
+        now_sec: Optional[int] = None,
+    ) -> None:
+        if not self._tracked_positions:
+            return
+        exit_tf = "M5" if "M5" in candles_by_tf else self.profiles[0].strategy.timeframe
+        exit_candles = candles_by_tf.get(exit_tf, [])
+        if not exit_candles:
+            return
+        latest_c = exit_candles[-1]
+        latest_ts = int(latest_c["time"])
+        if self._last_exit_check_candle_time == latest_ts:
+            return
+        self._last_exit_check_candle_time = latest_ts
+
+        # Also update MFE from the latest closed candle high/low
+        for pid, pos in self._tracked_positions.items():
+            opened_candle = self._position_opened_candle.get(pid, 0)
+            if latest_ts > opened_candle:
+                prev_mfe = self._position_mfe_price.get(pid, pos.entry_price)
+                if pos.side == "BUY":
+                    self._position_mfe_price[pid] = max(prev_mfe, float(latest_c["high"]))
+                else:
+                    self._position_mfe_price[pid] = min(prev_mfe, float(latest_c["low"]))
+
+        exit_prof = next((p for p in self.profiles if p.strategy.timeframe == exit_tf), self.profiles[0])
+        now = int(now_sec if now_sec is not None else time.time())
+        min_age_sec = max(0, self.cfg.risk.exit_alert_min_minutes) * 60
+
+        for pid, pos in self._tracked_positions.items():
+            if pid in self._position_exit_alerted:
+                continue
+            opened_at = self._position_opened_at.get(pid, now)
+            if min_age_sec > 0 and (now - opened_at) < min_age_sec:
+                continue
+            advice = evaluate_trade_management(
+                side=pos.side,
+                entry_price=pos.entry_price,
+                current_sl=pos.stop_loss,
+                take_profit=pos.take_profit,
+                max_favorable_price=self._position_mfe_price.get(pid, pos.entry_price),
+                candles=exit_candles,
+                cfg=exit_prof.strategy,
+                be_done=pid in self._position_be_alerted,
+                lock_done=pid in self._position_lock_alerted,
+            )
+            if advice is None:
+                continue
+            age_min = max(0, (now - opened_at) // 60)
+            mode_label = self._position_modes.get(pid, exit_prof.name)
+            if advice.action == "close_now":
+                self._position_exit_alerted.add(pid)
+                logger.info("[%s] Close advice for %s: %s", mode_label, pid, advice.reason)
+                self.notifier.notify_close_warning(
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    current_price=current_price,
+                    unrealized_pnl=pos.unrealized_pnl,
+                    reason=advice.reason,
+                    age_minutes=age_min,
+                    mode_label=mode_label,
+                )
+            elif advice.action in ("move_sl_be", "lock_profit") and advice.suggested_sl is not None:
+                if advice.action == "move_sl_be":
+                    self._position_be_alerted.add(pid)
+                else:
+                    self._position_lock_alerted.add(pid)
+                logger.info("[%s] Move SL advice (%s -> %.2f) for %s: %s", mode_label, advice.action, advice.suggested_sl, pid, advice.reason)
+                self.notifier.notify_move_sl_advice(
+                    side=pos.side,
+                    action=advice.action,
+                    entry_price=pos.entry_price,
+                    current_price=current_price,
+                    new_sl=advice.suggested_sl,
+                    unrealized_pnl=pos.unrealized_pnl,
+                    reason=advice.reason,
+                    mode_label=mode_label,
+                )
 
     def _maybe_send_heartbeat(
         self, price: float, spread: float, now_utc: Optional[datetime] = None

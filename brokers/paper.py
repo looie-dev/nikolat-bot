@@ -285,9 +285,13 @@ class PaperBroker(BrokerClient):
         size: float,
         stop_loss: float,
         take_profit: float,
+        entry_override: Optional[float] = None,
     ) -> OrderResult:
-        quote = self.get_quote()
-        fill = quote.ask if side.upper() == "BUY" else quote.bid
+        if entry_override is not None and entry_override > 0:
+            fill = float(entry_override)
+        else:
+            quote = self.get_quote()
+            fill = quote.ask if side.upper() == "BUY" else quote.bid
         pos_id = f"PAPER-{self._state['next_id']}"
         self._state["next_id"] += 1
         self._state["open_positions"].append(
@@ -303,6 +307,42 @@ class PaperBroker(BrokerClient):
         )
         self._save_state()
         return OrderResult(True, pos_id, round(fill, 2), float(size), "Paper order filled")
+
+    def close_position(
+        self,
+        position_id: str,
+        close_price: Optional[float] = None,
+        reason: str = "Đóng thủ công",
+    ) -> Optional[ClosedTradeInfo]:
+        for idx, pos in enumerate(self._state["open_positions"]):
+            if pos["position_id"] != position_id:
+                continue
+            if close_price is not None and close_price > 0:
+                exit_p = float(close_price)
+            else:
+                q = self.get_quote()
+                exit_p = q.bid if pos["side"] == "BUY" else q.ask
+            entry = float(pos["entry_price"])
+            size = float(pos["size"])
+            cs = self._spec.contract_size
+            pnl = (exit_p - entry) * size * cs if pos["side"] == "BUY" else (entry - exit_p) * size * cs
+            self._state["balance"] = round(self._state["balance"] + pnl, 2)
+            info = {
+                "position_id": position_id,
+                "close_price": round(exit_p, 2),
+                "realized_pnl": round(pnl, 2),
+                "reason": reason,
+            }
+            self._state["closed_trades"][position_id] = info
+            self._state["open_positions"].pop(idx)
+            self._save_state()
+            return ClosedTradeInfo(
+                position_id=position_id,
+                close_price=float(info["close_price"]),
+                realized_pnl=float(info["realized_pnl"]),
+                reason=reason,
+            )
+        return None
 
     def update_stop_loss(self, position_id: str, new_stop_loss: float) -> bool:
         for pos in self._state["open_positions"]:
