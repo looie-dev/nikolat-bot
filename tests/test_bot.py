@@ -1,6 +1,7 @@
 """Unit tests for XAUUSD trading bot modules."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import tempfile
@@ -534,6 +535,45 @@ class TestBrokersAndBotLoop(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_scheduled_heartbeat_hours_vn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            b_cfg = BrokerConfig(
+                provider="paper",
+                paper_initial_balance=100.0,
+                paper_state_file=str(Path(tmpdir) / "paper.json"),
+            )
+            broker = PaperBroker(b_cfg, candle_fetcher=lambda tf, cnt: _make_candles([3500.0] * 5))
+            notifier = MagicMock()
+            nf = NewsFilter(buffer_minutes=15)
+            nf.set_events_for_test([])
+
+            bot_cfg = BotConfig(
+                strategy=StrategyConfig(),
+                risk=RiskConfig(),
+                broker=b_cfg,
+                telegram=TelegramConfig(
+                    bot_token="x",
+                    chat_id="y",
+                    heartbeat_hours=(9, 12, 18, 21),
+                    heartbeat_tz_offset_hours=7,
+                ),
+            )
+            bot = TradingBot(bot_cfg, broker=broker, notifier=notifier, news_filter=nf)
+
+            # 08:59 VN = 01:59 UTC -> should NOT send
+            self.assertFalse(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 1, 59, tzinfo=timezone.utc)))
+            # 09:00 VN = 02:00 UTC -> should send once
+            self.assertTrue(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 2, 0, tzinfo=timezone.utc)))
+            # 09:25 VN = 02:25 UTC -> same hour slot, must NOT send again
+            self.assertFalse(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 2, 25, tzinfo=timezone.utc)))
+            # 12:00 VN (05:00 UTC), 18:00 VN (11:00 UTC), 21:00 VN (14:00 UTC) -> all send
+            self.assertTrue(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 5, 0, tzinfo=timezone.utc)))
+            self.assertTrue(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 11, 0, tzinfo=timezone.utc)))
+            self.assertTrue(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 14, 0, tzinfo=timezone.utc)))
+            # 22:00 VN (15:00 UTC) -> should NOT send
+            self.assertFalse(bot._maybe_send_heartbeat(3500.0, 0.50, datetime(2026, 11, 26, 15, 0, tzinfo=timezone.utc)))
+            self.assertEqual(notifier.notify_status.call_count, 4)
 
 
 if __name__ == "__main__":

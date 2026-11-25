@@ -1,13 +1,13 @@
 """Main runner for the XAUUSD Multi-Confluence Trading Bot."""
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import signal
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from brokers import BrokerClient, Position, create_broker
 from config import BotConfig, StrategyProfile, load_config
@@ -55,6 +55,7 @@ class TradingBot:
         }
         self._last_atr: Dict[str, float] = {}
         self._last_status_time: float = 0.0
+        self._sent_heartbeat_slots: Set[str] = set()
         self._running: bool = True
 
     def initialize(self) -> None:
@@ -325,33 +326,58 @@ class TradingBot:
             if res is not None:
                 triggered = res
 
-        if triggered is None:
-            self._maybe_send_heartbeat(quote.mid, quote.spread)
+        self._maybe_send_heartbeat(quote.mid, quote.spread)
         return triggered
 
-    def _maybe_send_heartbeat(self, price: float, spread: float) -> None:
-        interval = self.cfg.telegram.status_interval_minutes * 60
-        if interval <= 0:
-            return
-        now = time.time()
-        if now - self._last_status_time < interval:
-            return
-        self._last_status_time = now
+    def _maybe_send_heartbeat(
+        self, price: float, spread: float, now_utc: Optional[datetime] = None
+    ) -> bool:
+        hb_hours = self.cfg.telegram.heartbeat_hours
+        tz = timezone(timedelta(hours=self.cfg.telegram.heartbeat_tz_offset_hours))
+        time_label = ""
+
+        if hb_hours:
+            current_utc = now_utc or datetime.now(timezone.utc)
+            now_local = current_utc.astimezone(tz)
+            if now_local.hour not in hb_hours:
+                return False
+            slot = f"{now_local.strftime('%Y-%m-%d')}-{now_local.hour:02d}"
+            if slot in self._sent_heartbeat_slots:
+                return False
+            if len(self._sent_heartbeat_slots) > 32:
+                self._sent_heartbeat_slots.clear()
+            self._sent_heartbeat_slots.add(slot)
+            time_label = now_local.strftime("%H:%M")
+        else:
+            interval = self.cfg.telegram.status_interval_minutes * 60
+            if interval <= 0:
+                return False
+            now = time.time()
+            if now - self._last_status_time < interval:
+                return False
+            self._last_status_time = now
+
         account = self.broker.get_account_summary()
         upcoming = self.news_filter.upcoming_events(hours=12)
         next_news = None
         if upcoming:
             ev = upcoming[0]
-            dt_str = datetime.fromtimestamp(ev.timestamp_sec, tz=timezone.utc).strftime("%H:%M UTC")
+            dt_str = datetime.fromtimestamp(ev.timestamp_sec, tz=tz).strftime("%H:%M %d/%m VN")
             next_news = f"{ev.title} ({dt_str})"
+        extra: Dict[str, Any] = {}
+        if next_news:
+            extra["next_news"] = next_news
+        if time_label:
+            extra["time_label"] = time_label
         self.notifier.notify_status(
             provider=self.cfg.broker.provider,
             balance=account.balance,
             open_positions=len(self._tracked_positions),
             last_price=price,
             spread_usd=spread,
-            extra={"next_news": next_news} if next_news else None,
+            extra=extra or None,
         )
+        return True
 
     def status_snapshot(self) -> Dict[str, Any]:
         return {

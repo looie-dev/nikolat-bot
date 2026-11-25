@@ -158,6 +158,8 @@ class TelegramConfig:
     bot_token: str = ""
     chat_id: str = ""
     status_interval_minutes: int = 60
+    heartbeat_hours: Tuple[int, ...] = (9, 12, 18, 21)
+    heartbeat_tz_offset_hours: int = 7
 
     @property
     def enabled(self) -> bool:
@@ -242,10 +244,16 @@ def load_config(env_path: str = ".env") -> BotConfig:
         paper_state_file=os.environ.get("PAPER_STATE_FILE", "data/paper_state.json").strip(),
         paper_contract_size=_env_float("PAPER_CONTRACT_SIZE", 1.0),
     )
+    hb_raw = os.environ.get("HEARTBEAT_HOURS", "9,12,18,21").strip()
+    hb_hours: Tuple[int, ...] = tuple(
+        int(h.strip()) for h in hb_raw.split(",") if h.strip() and 0 <= int(h.strip()) <= 23
+    )
     telegram = TelegramConfig(
         bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         chat_id=os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
         status_interval_minutes=_env_int("STATUS_INTERVAL_MINUTES", 60),
+        heartbeat_hours=hb_hours,
+        heartbeat_tz_offset_hours=_env_int("HEARTBEAT_TZ_OFFSET_HOURS", 7),
     )
     return BotConfig(
         strategy=strategy,

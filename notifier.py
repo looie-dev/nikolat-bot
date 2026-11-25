@@ -144,8 +144,9 @@ class TelegramNotifier:
         spread_usd: float,
         extra: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        time_tag = f" ({html.escape(str(extra['time_label']))} VN)" if extra and extra.get("time_label") else ""
         msg = (
-            f"<b>💓 XAUUSD BOT HEARTBEAT</b>\n"
+            f"<b>💓 XAUUSD BOT HEARTBEAT{time_tag}</b>\n"
             f"• Sàn: <code>{html.escape(provider.upper())}</code> | Giá: <b>{last_price:.2f}</b> (Spread ${spread_usd:.2f})\n"
             f"• Số dư: <b>${balance:,.2f}</b> | Lệnh đang mở: <b>{open_positions}</b>"
         )
