@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from config import StrategyConfig
-from strategy import TrendPullbackStrategy, compute_htf_bias_series, compute_indicators
+from strategy import compute_htf_bias_series, compute_indicators, create_strategy
 
 
 @dataclass
@@ -47,7 +47,7 @@ def run_backtest(
     cooldown_candles: int = 2,
     htf_candles: Optional[List[Dict[str, Any]]] = None,
 ) -> BacktestMetrics:
-    strategy = TrendPullbackStrategy(cfg)
+    strategy = create_strategy(cfg)
     cache = compute_indicators(candles, cfg)
     htf_biases = (
         compute_htf_bias_series(

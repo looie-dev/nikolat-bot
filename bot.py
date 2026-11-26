@@ -21,7 +21,7 @@ from risk_manager import RiskManager
 from state_store import load_json_state, save_json_state
 from strategy import (
     TradeSignal,
-    TrendPullbackStrategy,
+    create_strategy,
     evaluate_trade_management,
     summarize_market_state,
 )
@@ -44,8 +44,8 @@ class TradingBot:
         self.notifier = notifier or TelegramNotifier(cfg.telegram)
         self.news_filter = news_filter or NewsFilter(buffer_minutes=cfg.risk.news_buffer_minutes)
         self.profiles = cfg.active_profiles
-        self._strategies: Dict[str, TrendPullbackStrategy] = {
-            p.name: TrendPullbackStrategy(p.strategy) for p in self.profiles
+        self._strategies = {
+            p.name: create_strategy(p.strategy) for p in self.profiles
         }
         self.risk_manager = RiskManager(
             risk_percent=cfg.risk.risk_percent,

@@ -69,6 +69,9 @@ class StrategyConfig:
     htf_timeframe: str = ""             # Optional higher-TF trend filter (e.g. "M15", "H1")
     htf_ema_fast: int = 20
     htf_ema_slow: int = 50
+    strategy_type: str = "trend_pullback"  # "trend_pullback" or "ict"
+    ict_killzones_utc: Tuple[Tuple[int, int], ...] = ((7, 10), (12, 16))
+    ict_entry_mode: str = "mss_fvg"        # "mss_fvg" or "fvg_retest"
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,23 @@ STRATEGY_PRESETS: Dict[str, StrategyConfig] = {
         htf_timeframe="H1",
         htf_ema_fast=20,
         htf_ema_slow=50,
+    ),
+    "ict_intraday": StrategyConfig(
+        strategy_type="ict",
+        timeframe="M5",
+        ema_fast=50,
+        ema_slow=200,
+        sl_atr_mult=0.8,
+        rr_ratio=2.0,
+        min_sl_usd=0.0,
+        max_sl_usd=0.0,
+        max_tp_usd=0.0,
+        use_session_filter=True,
+        htf_timeframe="H1",
+        htf_ema_fast=20,
+        htf_ema_slow=50,
+        ict_killzones_utc=((7, 10), (12, 16)),
+        ict_entry_mode="mss_fvg",
     ),
 }
 

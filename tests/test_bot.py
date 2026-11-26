@@ -16,13 +16,13 @@ from bot import TradingBot
 from brokers.capital import CapitalBroker
 from brokers.oanda import OandaBroker
 from brokers.paper import PaperBroker
-from config import BotConfig, BrokerConfig, RiskConfig, StrategyConfig, StrategyProfile, TelegramConfig
+from config import BotConfig, BrokerConfig, RiskConfig, STRATEGY_PRESETS, StrategyConfig, StrategyProfile, TelegramConfig
 from health_server import build_health_response, start_health_server
 from indicators import adx_series, atr_series, ema_series, macd_series, rsi_series
 from news_filter import NewsEvent, NewsFilter
 from notifier import TelegramNotifier, TelegramUserAction, parse_telegram_text_command
 from risk_manager import InstrumentSpec, RiskManager
-from strategy import TradeSignal, TrendPullbackStrategy
+from strategy import ICTIntradayStrategy, TradeSignal, TrendPullbackStrategy, evaluate_trade_management
 
 
 def _make_candles(closes, start_ts=1700046000, step=3600, spread=1.0):
@@ -159,6 +159,62 @@ class TestStrategy(unittest.TestCase):
         self.assertIsNotNone(sig)
         self.assertAlmostEqual(sig.entry_price - sig.stop_loss, 15.0, places=2)
         self.assertAlmostEqual(sig.take_profit - sig.entry_price, 25.0, places=2)
+
+    @staticmethod
+    def _build_ict_bull_sweep_candles():
+        # Build 70 M5 bars ending inside London Killzone (2026-11-26 08:30 UTC),
+        # starting in Asia session (00:00-07:00 UTC) with Asia low at 3500.0,
+        # sweeping below 3500.0 -> displacement + MSS + Bullish FVG.
+        end_dt = datetime(2026, 11, 26, 8, 30, tzinfo=timezone.utc)
+        end_ts = int(end_dt.timestamp())
+        total = 70
+        start_ts = end_ts - (total - 1) * 300
+        candles = []
+        for i in range(total - 5):
+            ts = start_ts + i * 300
+            base = 3502.0 + (i % 3) * 0.8
+            candles.append({
+                "time": ts, "open": base, "high": base + 1.5, "low": base - 1.2, "close": base + 0.4, "volume": 100.0
+            })
+        # Ensure clean Asia Low = 3500.0 earlier in the day (<07:00 UTC)
+        candles[5]["low"] = 3500.0
+        candles[5]["close"] = 3503.0
+        t_last = start_ts + (total - 5) * 300
+        # Sweep below Asia Low 3500 -> displacement breaking pre-sweep highs -> Bullish FVG (c2.high < c.low)
+        candles.extend([
+            {"time": t_last, "open": 3503.5, "high": 3504.5, "low": 3501.0, "close": 3502.0, "volume": 100.0},
+            {"time": t_last + 300, "open": 3502.0, "high": 3502.5, "low": 3499.0, "close": 3500.5, "volume": 120.0},
+            {"time": t_last + 600, "open": 3500.5, "high": 3503.0, "low": 3500.0, "close": 3502.5, "volume": 120.0},
+            {"time": t_last + 900, "open": 3502.5, "high": 3507.0, "low": 3502.0, "close": 3506.0, "volume": 200.0},
+            {"time": t_last + 1200, "open": 3506.0, "high": 3508.5, "low": 3504.0, "close": 3507.0, "volume": 180.0},
+        ])
+        return candles
+
+    def test_ict_intraday_sweep_mss_fvg_and_filters(self):
+        candles = self._build_ict_bull_sweep_candles()
+        h1_bull = _make_candles([3400.0 + i * 1.5 for i in range(70)], start_ts=candles[-1]["time"] - 69 * 3600, step=3600, spread=2.0)
+        h1_bear = _make_candles([3700.0 - i * 1.5 for i in range(70)], start_ts=candles[-1]["time"] - 69 * 3600, step=3600, spread=2.0)
+        ict_cfg = STRATEGY_PRESETS["ict_intraday"]
+        strat = ICTIntradayStrategy(ict_cfg)
+
+        sig = strat.evaluate_latest(candles, htf_candles=h1_bull)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.side, "BUY")
+        self.assertLess(sig.stop_loss, 3500.0)
+        self.assertIn("ICT Sweep", sig.reason)
+
+        # Counter H1 bias blocks ICT signal
+        self.assertIsNone(strat.evaluate_latest(candles, htf_candles=h1_bear))
+
+        # Outside Killzone (11:00 UTC) blocks ICT signal
+        outside = list(candles)
+        outside[-1] = dict(outside[-1], time=int(datetime(2026, 11, 26, 11, 0, tzinfo=timezone.utc).timestamp()))
+        self.assertIsNone(strat.evaluate_latest(outside, htf_candles=h1_bull))
+
+        # ICT trade management skips EMA close_now, keeps BE / lock protection
+        bear_bars = _make_candles([3520.0 - i * 1.2 for i in range(70)], start_ts=candles[-1]["time"], step=300, spread=0.5)
+        adv = evaluate_trade_management("BUY", 3500.0, 3490.0, 3520.0, 3502.0, bear_bars, ict_cfg)
+        self.assertIsNone(adv)
 
 
 class TestRiskAndNews(unittest.TestCase):
