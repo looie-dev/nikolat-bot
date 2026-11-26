@@ -1,13 +1,16 @@
 """Main runner for the XAUUSD Multi-Confluence Trading Bot."""
 
 import argparse
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+import html
 import logging
 import os
+from pathlib import Path
 import signal
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from brokers import BrokerClient, PaperBroker, Position, create_broker
 from config import BotConfig, StrategyProfile, load_config
@@ -15,7 +18,13 @@ from health_server import start_health_server
 from news_filter import NewsFilter
 from notifier import TelegramNotifier, TelegramUserAction
 from risk_manager import RiskManager
-from strategy import TradeSignal, TrendPullbackStrategy, evaluate_trade_management
+from state_store import load_json_state, save_json_state
+from strategy import (
+    TradeSignal,
+    TrendPullbackStrategy,
+    evaluate_trade_management,
+    summarize_market_state,
+)
 
 logger = logging.getLogger("xauusd_bot")
 
@@ -46,7 +55,16 @@ class TradingBot:
             max_spread_usd=cfg.risk.max_spread_usd,
             fixed_size=cfg.risk.fixed_size,
             max_size=cfg.risk.max_size,
+            loss_streak_reduce_after=cfg.risk.loss_streak_reduce_after,
+            loss_streak_risk_factor=cfg.risk.loss_streak_risk_factor,
         )
+        if cfg.bot_state_file:
+            self._bot_state_path = Path(cfg.bot_state_file)
+        elif cfg.broker.paper_state_file:
+            self._bot_state_path = Path(cfg.broker.paper_state_file).with_name("bot_state.json")
+        else:
+            self._bot_state_path = Path("data/bot_state.json")
+
         self._tracked_positions: Dict[str, Position] = {}
         self._position_modes: Dict[str, str] = {}
         self._position_opened_at: Dict[str, int] = {}
@@ -56,35 +74,169 @@ class TradingBot:
         self._position_be_alerted: Set[str] = set()
         self._position_lock_alerted: Set[str] = set()
         self._last_evaluated_candle_time: Dict[str, int] = {}
-        self._last_exit_check_candle_time: Optional[int] = None
+        self._last_exit_check_candle_by_tf: Dict[str, int] = {}
         self._candles_since_close: Dict[str, int] = {
             p.name: cfg.risk.cooldown_candles for p in self.profiles
         }
         self._last_atr: Dict[str, float] = {}
         self._last_status_time: float = 0.0
         self._sent_heartbeat_slots: Set[str] = set()
+        self._sent_news_warnings: Set[str] = set()
+        self._sent_weekend_warnings: Set[str] = set()
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
         self._msg_to_confirm: Dict[int, str] = {}
         self._msg_to_position: Dict[int, str] = {}
+        self._deferred_info_actions: List[TelegramUserAction] = []
         self._tg_offset: int = 0
         self._confirm_seq: int = 0
+        self._paused: bool = False
         self._running: bool = True
 
+    @property
+    def _last_exit_check_candle_time(self) -> Optional[int]:
+        if not self._last_exit_check_candle_by_tf:
+            return None
+        return max(self._last_exit_check_candle_by_tf.values())
+
+    @_last_exit_check_candle_time.setter
+    def _last_exit_check_candle_time(self, value: Optional[int]) -> None:
+        if value is None:
+            self._last_exit_check_candle_by_tf.clear()
+        else:
+            for tf in list(self._last_exit_check_candle_by_tf.keys()):
+                self._last_exit_check_candle_by_tf[tf] = value
+
+    def _serialize_signal(self, sig: TradeSignal) -> Dict[str, Any]:
+        return asdict(sig)
+
+    def _deserialize_signal(self, raw: Dict[str, Any]) -> TradeSignal:
+        return TradeSignal(
+            side=str(raw["side"]),
+            entry_price=float(raw["entry_price"]),
+            stop_loss=float(raw["stop_loss"]),
+            take_profit=float(raw["take_profit"]),
+            atr=float(raw["atr"]),
+            rr_ratio=float(raw["rr_ratio"]),
+            candle_time=int(raw["candle_time"]),
+            reason=str(raw.get("reason", "")),
+            indicators={str(k): float(v) for k, v in (raw.get("indicators") or {}).items()},
+        )
+
+    def _save_runtime_state(self) -> None:
+        pending_ser: Dict[str, Any] = {}
+        for cid, item in self._pending_confirmations.items():
+            pending_ser[cid] = {
+                "signal": self._serialize_signal(item["signal"]),
+                "size": float(item["size"]),
+                "risk_usd": float(item["risk_usd"]),
+                "spread": float(item.get("spread", 0.0)),
+                "mode": str(item["mode"]),
+                "msg_id": item.get("msg_id"),
+                "created_at": int(item["created_at"]),
+            }
+        payload = {
+            "position_modes": self._position_modes,
+            "position_opened_at": self._position_opened_at,
+            "position_opened_candle": self._position_opened_candle,
+            "position_mfe_price": self._position_mfe_price,
+            "position_exit_alerted": sorted(self._position_exit_alerted),
+            "position_be_alerted": sorted(self._position_be_alerted),
+            "position_lock_alerted": sorted(self._position_lock_alerted),
+            "last_evaluated_candle_time": self._last_evaluated_candle_time,
+            "candles_since_close": self._candles_since_close,
+            "last_atr": self._last_atr,
+            "sent_heartbeat_slots": sorted(self._sent_heartbeat_slots),
+            "sent_news_warnings": sorted(self._sent_news_warnings),
+            "sent_weekend_warnings": sorted(self._sent_weekend_warnings),
+            "pending_confirmations": pending_ser,
+            "msg_to_confirm": {str(k): v for k, v in self._msg_to_confirm.items()},
+            "msg_to_position": {str(k): v for k, v in self._msg_to_position.items()},
+            "confirm_seq": self._confirm_seq,
+            "paused": self._paused,
+            "risk_state": self.risk_manager.export_state(),
+        }
+        try:
+            save_json_state(self._bot_state_path, payload, remote_key=f"bot:{self._bot_state_path.name}")
+        except Exception as exc:
+            logger.warning("Failed to save bot runtime state: %s", exc)
+
+    def _load_runtime_state(self) -> None:
+        state = load_json_state(
+            self._bot_state_path,
+            default_factory=dict,
+            remote_key=f"bot:{self._bot_state_path.name}",
+        )
+        if not state:
+            return
+        self._position_modes = {str(k): str(v) for k, v in (state.get("position_modes") or {}).items()}
+        self._position_opened_at = {str(k): int(v) for k, v in (state.get("position_opened_at") or {}).items()}
+        self._position_opened_candle = {str(k): int(v) for k, v in (state.get("position_opened_candle") or {}).items()}
+        self._position_mfe_price = {str(k): float(v) for k, v in (state.get("position_mfe_price") or {}).items()}
+        self._position_exit_alerted = {str(x) for x in (state.get("position_exit_alerted") or [])}
+        self._position_be_alerted = {str(x) for x in (state.get("position_be_alerted") or [])}
+        self._position_lock_alerted = {str(x) for x in (state.get("position_lock_alerted") or [])}
+        self._last_evaluated_candle_time = {
+            str(k): int(v) for k, v in (state.get("last_evaluated_candle_time") or {}).items()
+        }
+        if state.get("candles_since_close"):
+            self._candles_since_close.update({str(k): int(v) for k, v in state["candles_since_close"].items()})
+        self._last_atr = {str(k): float(v) for k, v in (state.get("last_atr") or {}).items()}
+        self._sent_heartbeat_slots = {str(x) for x in (state.get("sent_heartbeat_slots") or [])}
+        self._sent_news_warnings = {str(x) for x in (state.get("sent_news_warnings") or [])}
+        self._sent_weekend_warnings = {str(x) for x in (state.get("sent_weekend_warnings") or [])}
+        self._confirm_seq = int(state.get("confirm_seq", 0))
+        self._paused = bool(state.get("paused", False))
+        if state.get("risk_state"):
+            self.risk_manager.restore_state(state["risk_state"])
+        for cid, raw in (state.get("pending_confirmations") or {}).items():
+            try:
+                self._pending_confirmations[str(cid)] = {
+                    "signal": self._deserialize_signal(raw["signal"]),
+                    "size": float(raw["size"]),
+                    "risk_usd": float(raw["risk_usd"]),
+                    "spread": float(raw.get("spread", 0.0)),
+                    "mode": str(raw["mode"]),
+                    "msg_id": raw.get("msg_id"),
+                    "created_at": int(raw["created_at"]),
+                }
+            except Exception as exc:
+                logger.warning("Skipping corrupt pending confirmation %s: %s", cid, exc)
+        self._msg_to_confirm = {int(k): str(v) for k, v in (state.get("msg_to_confirm") or {}).items()}
+        self._msg_to_position = {int(k): str(v) for k, v in (state.get("msg_to_position") or {}).items()}
+
+    def _clear_position_tracking(self, pid: str) -> None:
+        self._tracked_positions.pop(pid, None)
+        self._position_modes.pop(pid, None)
+        self._position_opened_at.pop(pid, None)
+        self._position_opened_candle.pop(pid, None)
+        self._position_mfe_price.pop(pid, None)
+        self._position_exit_alerted.discard(pid)
+        self._position_be_alerted.discard(pid)
+        self._position_lock_alerted.discard(pid)
+
     def initialize(self) -> None:
-        """Load initial broker state and send startup Telegram notification."""
+        """Load saved runtime state + broker state and send startup Telegram notification."""
+        self._load_runtime_state()
         account = self.broker.get_account_summary()
         now_sec = int(time.time())
-        for pos in self.broker.get_open_positions():
+        open_positions = self.broker.get_open_positions()
+        active_ids = {p.position_id for p in open_positions}
+        for stale_id in list(self._position_modes.keys()):
+            if stale_id not in active_ids:
+                self._clear_position_tracking(stale_id)
+        for pos in open_positions:
             self._tracked_positions[pos.position_id] = pos
-            self._position_opened_at[pos.position_id] = now_sec
-            self._position_mfe_price[pos.position_id] = pos.entry_price
+            self._position_opened_at.setdefault(pos.position_id, now_sec)
+            self._position_mfe_price.setdefault(pos.position_id, pos.entry_price)
         self.news_filter.refresh(force=True)
-        if self.cfg.manual_confirm_tracking:
-            self._tg_offset = self.notifier.get_latest_update_offset()
+        if self.cfg.manual_confirm_tracking or isinstance(self.notifier, TelegramNotifier):
+            offset = self.notifier.get_latest_update_offset()
+            if isinstance(offset, int):
+                self._tg_offset = offset
         self._last_status_time = time.time()
         mode_summary = " + ".join(f"{p.name}({p.strategy.timeframe})" for p in self.profiles)
         logger.info(
-            "Bot initialized | provider=%s env=%s symbol=%s modes=[%s] balance=%.2f %s open=%d",
+            "Bot initialized | provider=%s env=%s symbol=%s modes=[%s] balance=%.2f %s open=%d paused=%s",
             self.cfg.broker.provider,
             self.cfg.broker.environment,
             self.broker.symbol,
@@ -92,6 +244,7 @@ class TradingBot:
             account.balance,
             account.currency,
             len(self._tracked_positions),
+            self._paused,
         )
         self.notifier.notify_startup(
             provider=self.cfg.broker.provider,
@@ -103,23 +256,21 @@ class TradingBot:
             risk_percent=self.cfg.risk.risk_percent,
             dry_run=self.cfg.dry_run,
         )
+        self._save_runtime_state()
 
     def _sync_positions(self, current_price: float) -> None:
         current_positions = self.broker.get_open_positions()
         current_map = {p.position_id: p for p in current_positions}
+        state_changed = False
 
         closed_ids = [pid for pid in self._tracked_positions if pid not in current_map]
         if closed_ids:
+            state_changed = True
             account = self.broker.get_account_summary()
             for pid in closed_ids:
                 prev = self._tracked_positions[pid]
-                mode_label = self._position_modes.pop(pid, "")
-                self._position_opened_at.pop(pid, None)
-                self._position_opened_candle.pop(pid, None)
-                self._position_mfe_price.pop(pid, None)
-                self._position_exit_alerted.discard(pid)
-                self._position_be_alerted.discard(pid)
-                self._position_lock_alerted.discard(pid)
+                mode_label = self._position_modes.get(pid, "")
+                self._clear_position_tracking(pid)
                 if mode_label:
                     self._candles_since_close[mode_label] = 0
                 info = self.broker.get_closed_trade_info(pid)
@@ -157,13 +308,19 @@ class TradingBot:
                 if pos.side == "BUY" and (pos.stop_loss is None or pos.stop_loss < pos.entry_price):
                     if current_price >= pos.entry_price + trigger_dist:
                         if self.broker.update_stop_loss(pid, pos.entry_price):
+                            current_map[pid] = replace(pos, stop_loss=round(pos.entry_price, 2))
+                            state_changed = True
                             logger.info("Moved BUY %s SL to breakeven %.2f", pid, pos.entry_price)
                 elif pos.side == "SELL" and (pos.stop_loss is None or pos.stop_loss > pos.entry_price):
                     if current_price <= pos.entry_price - trigger_dist:
                         if self.broker.update_stop_loss(pid, pos.entry_price):
+                            current_map[pid] = replace(pos, stop_loss=round(pos.entry_price, 2))
+                            state_changed = True
                             logger.info("Moved SELL %s SL to breakeven %.2f", pid, pos.entry_price)
 
         self._tracked_positions = current_map
+        if state_changed:
+            self._save_runtime_state()
 
     def _adjust_levels_to_quote(self, sig: TradeSignal, bid: float, ask: float) -> TradeSignal:
         """Anchor SL/TP distances to actual executable bid/ask price."""
@@ -196,6 +353,7 @@ class TradingBot:
         quote_bid: float,
         quote_ask: float,
         quote_spread: float,
+        htf_candles: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[TradeSignal]:
         if not candles:
             return None
@@ -212,6 +370,7 @@ class TradingBot:
         if per_mode_cap > 0:
             mode_open_count = sum(1 for m in self._position_modes.values() if m == profile.name)
             if mode_open_count >= per_mode_cap:
+                self._save_runtime_state()
                 return None
 
         if self._candles_since_close[profile.name] <= self.cfg.risk.cooldown_candles:
@@ -221,10 +380,12 @@ class TradingBot:
                 self._candles_since_close[profile.name],
                 self.cfg.risk.cooldown_candles,
             )
+            self._save_runtime_state()
             return None
 
-        sig = self._strategies[profile.name].evaluate_latest(candles)
+        sig = self._strategies[profile.name].evaluate_latest(candles, htf_candles=htf_candles)
         if sig is None:
+            self._save_runtime_state()
             return None
 
         self._last_atr[profile.name] = sig.atr
@@ -301,6 +462,7 @@ class TradingBot:
             }
             if msg_id:
                 self._msg_to_confirm[msg_id] = confirm_id
+            self._save_runtime_state()
             logger.info("[%s] Sent signal %s waiting for Telegram confirmation", profile.name, confirm_id)
             return live_sig
 
@@ -311,32 +473,19 @@ class TradingBot:
             take_profit=live_sig.take_profit,
         )
         if result.success:
-            self.risk_manager.record_trade_opened(account.balance)
-            self._position_modes[result.order_id] = profile.name
-            self._position_opened_at[result.order_id] = int(time.time())
-            self._position_opened_candle[result.order_id] = int(live_sig.candle_time)
             fill_p = result.fill_price or live_sig.entry_price
-            self._position_mfe_price[result.order_id] = fill_p
-            self._tracked_positions[result.order_id] = Position(
-                position_id=result.order_id,
-                side=live_sig.side,
+            self._register_open_position(
+                order_id=result.order_id,
+                mode_name=profile.name,
+                sig=live_sig,
                 size=result.size,
-                entry_price=result.fill_price or live_sig.entry_price,
+                fill_price=fill_p,
                 stop_loss=live_sig.stop_loss,
                 take_profit=live_sig.take_profit,
-                unrealized_pnl=0.0,
+                balance=account.balance,
+                now_sec=int(time.time()),
             )
-            filled_sig = TradeSignal(
-                side=live_sig.side,
-                entry_price=round(result.fill_price or live_sig.entry_price, 2),
-                stop_loss=live_sig.stop_loss,
-                take_profit=live_sig.take_profit,
-                atr=live_sig.atr,
-                rr_ratio=live_sig.rr_ratio,
-                candle_time=live_sig.candle_time,
-                reason=live_sig.reason,
-                indicators=live_sig.indicators,
-            )
+            filled_sig = replace(live_sig, entry_price=round(fill_p, 2))
             logger.info(
                 "[%s] Order filled: id=%s price=%.2f size=%.2f",
                 profile.name,
@@ -354,6 +503,7 @@ class TradingBot:
                 dry_run=False,
                 mode_label=profile.name,
             )
+            self._save_runtime_state()
             return filled_sig
 
         logger.error("[%s] Order placement failed: %s", profile.name, result.message)
@@ -382,164 +532,340 @@ class TradingBot:
             return next(iter(self._tracked_positions.keys()))
         return None
 
+    def _register_open_position(
+        self,
+        order_id: str,
+        mode_name: str,
+        sig: TradeSignal,
+        size: float,
+        fill_price: float,
+        stop_loss: float,
+        take_profit: float,
+        balance: float,
+        now_sec: int,
+    ) -> None:
+        self.risk_manager.record_trade_opened(balance)
+        self._position_modes[order_id] = mode_name
+        self._position_opened_at[order_id] = now_sec
+        self._position_opened_candle[order_id] = int(sig.candle_time)
+        self._position_mfe_price[order_id] = fill_price
+        self._tracked_positions[order_id] = Position(
+            position_id=order_id,
+            side=sig.side,
+            size=size,
+            entry_price=fill_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            unrealized_pnl=0.0,
+        )
+
+    def _reanchor_sl_tp(self, sig: TradeSignal, entry_override: Optional[float]) -> Tuple[float, float]:
+        if entry_override is None or entry_override <= 0:
+            return sig.stop_loss, sig.take_profit
+        sl_dist = abs(sig.entry_price - sig.stop_loss)
+        tp_dist = abs(sig.take_profit - sig.entry_price)
+        if sig.side == "BUY":
+            return round(entry_override - sl_dist, 2), round(entry_override + tp_dist, 2)
+        return round(entry_override + sl_dist, 2), round(entry_override - tp_dist, 2)
+
+    def _handle_enter_action(self, act: TelegramUserAction, now: int) -> bool:
+        cid = self._resolve_pending_id(act)
+        if not cid:
+            if act.callback_query_id:
+                self.notifier.answer_callback_query(act.callback_query_id, "Tín hiệu đã hết hạn hoặc đã xử lý")
+            return False
+        pending = self._pending_confirmations.pop(cid)
+        sig: TradeSignal = pending["signal"]
+        msg_id = pending.get("msg_id")
+        if msg_id:
+            self._msg_to_confirm.pop(msg_id, None)
+            self.notifier.clear_inline_buttons(msg_id)
+
+        entry_override = act.custom_price
+        adj_sl, adj_tp = self._reanchor_sl_tp(sig, entry_override)
+        order_kwargs: Dict[str, Any] = {
+            "side": sig.side,
+            "size": pending["size"],
+            "stop_loss": adj_sl,
+            "take_profit": adj_tp,
+        }
+        if isinstance(self.broker, PaperBroker):
+            order_kwargs["entry_override"] = entry_override
+        result = self.broker.place_market_order(**order_kwargs)
+        if not result.success:
+            if act.callback_query_id:
+                self.notifier.answer_callback_query(act.callback_query_id, f"Lỗi: {result.message}")
+            self.notifier.send_message(f"⚠️ Không ghi nhận được lệnh: {result.message}")
+            return True
+
+        account = self.broker.get_account_summary()
+        fill_p = result.fill_price or entry_override or sig.entry_price
+        mode_name = pending["mode"]
+        self._register_open_position(
+            order_id=result.order_id,
+            mode_name=mode_name,
+            sig=sig,
+            size=result.size,
+            fill_price=fill_p,
+            stop_loss=adj_sl,
+            take_profit=adj_tp,
+            balance=account.balance,
+            now_sec=now,
+        )
+        if act.callback_query_id:
+            self.notifier.answer_callback_query(act.callback_query_id, "Đã ghi nhận vào lệnh!")
+        conf_msg_id = self.notifier.notify_tracking_confirmed(
+            side=sig.side,
+            entry_price=fill_p,
+            position_id=result.order_id,
+            mode_label=mode_name,
+        )
+        if conf_msg_id:
+            self._msg_to_position[conf_msg_id] = result.order_id
+        if msg_id:
+            self._msg_to_position[msg_id] = result.order_id
+        if entry_override is not None and entry_override > 0:
+            diff = abs(fill_p - sig.entry_price)
+            if diff >= max(1.0, 2.0 * float(pending.get("spread", 0.5))):
+                self.notifier.send_message(
+                    f"⚠️ <b>Lệch giá sàn ${diff:.2f}</b> so với tín hiệu gốc ({sig.entry_price:.2f}) — "
+                    f"SL/TP đã tự dịch thành <code>{adj_sl:.2f}</code> / <code>{adj_tp:.2f}</code>."
+                )
+        logger.info("[%s] User confirmed trade entry %s @ %.2f", mode_name, result.order_id, fill_p)
+        return True
+
+    def _handle_movesl_action(self, act: TelegramUserAction) -> bool:
+        pid = self._resolve_position_id(act)
+        new_sl = act.custom_price
+        if not pid or new_sl is None or new_sl <= 0:
+            if act.callback_query_id:
+                self.notifier.answer_callback_query(act.callback_query_id, "Không tìm thấy lệnh hoặc giá SL không hợp lệ")
+            return False
+        pos = self._tracked_positions[pid]
+        if not self.broker.update_stop_loss(pid, new_sl):
+            if act.callback_query_id:
+                self.notifier.answer_callback_query(act.callback_query_id, "Cập nhật SL thất bại")
+            return False
+        rounded_sl = round(new_sl, 2)
+        self._tracked_positions[pid] = replace(pos, stop_loss=rounded_sl)
+        if (pos.side == "BUY" and rounded_sl >= pos.entry_price) or (
+            pos.side == "SELL" and rounded_sl <= pos.entry_price
+        ):
+            self._position_be_alerted.add(pid)
+        if act.callback_query_id:
+            self.notifier.answer_callback_query(act.callback_query_id, f"Đã dời SL -> {rounded_sl:.2f}")
+            if act.reply_to_message_id:
+                self.notifier.clear_inline_buttons(act.reply_to_message_id)
+        mode_label = self._position_modes.get(pid, "")
+        mode_tag = f" [{html.escape(mode_label)}]" if mode_label else ""
+        self.notifier.send_message(
+            f"🛡 <b>ĐÃ CẬP NHẬT SL — XAUUSD {pos.side}{mode_tag}</b>\n"
+            f"• Mã lệnh: <code>{html.escape(pid)}</code> | SL mới: <code>{rounded_sl:.2f}</code>"
+        )
+        return True
+
+    def _handle_close_action(self, act: TelegramUserAction) -> bool:
+        pid = self._resolve_position_id(act)
+        if not pid:
+            if act.callback_query_id:
+                self.notifier.answer_callback_query(act.callback_query_id, "Không tìm thấy lệnh đang mở")
+            return False
+        pos = self._tracked_positions.get(pid)
+        mode_label = self._position_modes.get(pid, "")
+        if not isinstance(self.broker, PaperBroker):
+            if act.callback_query_id:
+                self.notifier.answer_callback_query(act.callback_query_id, "Đã dừng theo dõi")
+            self._clear_position_tracking(pid)
+            return True
+        closed = self.broker.close_position(pid, close_price=act.custom_price, reason="Đóng thủ công qua Telegram")
+        if not closed:
+            return False
+        account = self.broker.get_account_summary()
+        self.risk_manager.record_trade_closed(closed.realized_pnl, account.balance)
+        self._clear_position_tracking(pid)
+        if mode_label:
+            self._candles_since_close[mode_label] = 0
+        if act.callback_query_id:
+            self.notifier.answer_callback_query(act.callback_query_id, "Đã đóng lệnh!")
+        if act.reply_to_message_id:
+            self.notifier.clear_inline_buttons(act.reply_to_message_id)
+        self.notifier.notify_position_closed(
+            side=pos.side if pos else "",
+            entry_price=pos.entry_price if pos else 0.0,
+            close_price=closed.close_price,
+            pnl_usd=closed.realized_pnl,
+            balance=account.balance,
+            position_id=pid,
+            reason=closed.reason,
+            mode_label=mode_label,
+        )
+        return True
+
     def _process_telegram_actions(self, now_sec: Optional[int] = None) -> None:
-        if not self.cfg.manual_confirm_tracking:
+        if not (self.cfg.manual_confirm_tracking or isinstance(self.notifier, TelegramNotifier)):
             return
         now = int(now_sec if now_sec is not None else time.time())
+        state_changed = False
         # Expire unconfirmed signals older than 20 minutes (default skipped)
-        expired = [k for k, v in self._pending_confirmations.items() if now - v["created_at"] > 1200]
-        for k in expired:
+        for k in [cid for cid, v in self._pending_confirmations.items() if now - v["created_at"] > 1200]:
             item = self._pending_confirmations.pop(k)
+            state_changed = True
             if item.get("msg_id"):
                 self._msg_to_confirm.pop(item["msg_id"], None)
                 self.notifier.clear_inline_buttons(item["msg_id"])
 
-        actions, self._tg_offset = self.notifier.poll_updates(self._tg_offset)
+        polled = self.notifier.poll_updates(self._tg_offset)
+        if not isinstance(polled, tuple) or len(polled) != 2:
+            if state_changed:
+                self._save_runtime_state()
+            return
+        actions, next_offset = polled
+        if isinstance(next_offset, int):
+            self._tg_offset = next_offset
+        if not isinstance(actions, list):
+            if state_changed:
+                self._save_runtime_state()
+            return
+
         for act in actions:
-            if act.action == "enter":
-                cid = self._resolve_pending_id(act)
-                if not cid:
-                    if act.callback_query_id:
-                        self.notifier.answer_callback_query(act.callback_query_id, "Tín hiệu đã hết hạn hoặc đã xử lý")
-                    continue
-                pending = self._pending_confirmations.pop(cid)
-                sig: TradeSignal = pending["signal"]
-                msg_id = pending.get("msg_id")
-                if msg_id:
-                    self._msg_to_confirm.pop(msg_id, None)
-                    self.notifier.clear_inline_buttons(msg_id)
-
-                entry_override = act.custom_price
-                if isinstance(self.broker, PaperBroker):
-                    result = self.broker.place_market_order(
-                        side=sig.side,
-                        size=pending["size"],
-                        stop_loss=sig.stop_loss,
-                        take_profit=sig.take_profit,
-                        entry_override=entry_override,
-                    )
-                else:
-                    result = self.broker.place_market_order(
-                        side=sig.side,
-                        size=pending["size"],
-                        stop_loss=sig.stop_loss,
-                        take_profit=sig.take_profit,
-                    )
-                if result.success:
-                    account = self.broker.get_account_summary()
-                    self.risk_manager.record_trade_opened(account.balance)
-                    fill_p = result.fill_price or entry_override or sig.entry_price
-                    mode_name = pending["mode"]
-                    self._position_modes[result.order_id] = mode_name
-                    self._position_opened_at[result.order_id] = now
-                    self._position_opened_candle[result.order_id] = int(sig.candle_time)
-                    self._position_mfe_price[result.order_id] = fill_p
-                    self._tracked_positions[result.order_id] = Position(
-                        position_id=result.order_id,
-                        side=sig.side,
-                        size=result.size,
-                        entry_price=fill_p,
-                        stop_loss=sig.stop_loss,
-                        take_profit=sig.take_profit,
-                        unrealized_pnl=0.0,
-                    )
-                    if act.callback_query_id:
-                        self.notifier.answer_callback_query(act.callback_query_id, "Đã ghi nhận vào lệnh!")
-                    conf_msg_id = self.notifier.notify_tracking_confirmed(
-                        side=sig.side,
-                        entry_price=fill_p,
-                        position_id=result.order_id,
-                        mode_label=mode_name,
-                    )
-                    if conf_msg_id:
-                        self._msg_to_position[conf_msg_id] = result.order_id
-                    if msg_id:
-                        self._msg_to_position[msg_id] = result.order_id
-                    logger.info("[%s] User confirmed trade entry %s @ %.2f", mode_name, result.order_id, fill_p)
-                else:
-                    if act.callback_query_id:
-                        self.notifier.answer_callback_query(act.callback_query_id, f"Lỗi: {result.message}")
-                    self.notifier.send_message(f"⚠️ Không ghi nhận được lệnh: {result.message}")
-
+            if act.action in ("status", "news", "help"):
+                self._deferred_info_actions.append(act)
+            elif act.action == "pause":
+                self._paused = True
+                state_changed = True
+                self.notifier.send_message(
+                    "⏸ <b>ĐÃ TẠM DỪNG TÍN HIỆU MỚI</b>\n"
+                    "• Bot vẫn tiếp tục theo dõi lệnh đang mở và cảnh báo dời SL/đóng lệnh.\n"
+                    "• Gửi <code>/resume</code> để bật lại quét kèo."
+                )
+            elif act.action == "resume":
+                self._paused = False
+                state_changed = True
+                self.notifier.send_message("▶️ <b>ĐÃ BẬT LẠI QUÉT TÍN HIỆU MỚI</b>")
+            elif act.action == "enter":
+                state_changed |= self._handle_enter_action(act, now)
             elif act.action == "skip":
                 cid = self._resolve_pending_id(act)
                 if cid:
                     pending = self._pending_confirmations.pop(cid)
-                    msg_id = pending.get("msg_id")
-                    if msg_id:
-                        self._msg_to_confirm.pop(msg_id, None)
-                        self.notifier.clear_inline_buttons(msg_id)
+                    state_changed = True
+                    if pending.get("msg_id"):
+                        self._msg_to_confirm.pop(pending["msg_id"], None)
+                        self.notifier.clear_inline_buttons(pending["msg_id"])
                 if act.callback_query_id:
                     self.notifier.answer_callback_query(act.callback_query_id, "Đã bỏ qua")
                 self.notifier.send_message("👌 Đã bỏ qua tín hiệu — bot sẽ không theo dõi lệnh này.")
-
+            elif act.action == "movesl":
+                state_changed |= self._handle_movesl_action(act)
             elif act.action == "close":
-                pid = self._resolve_position_id(act)
-                if not pid:
-                    if act.callback_query_id:
-                        self.notifier.answer_callback_query(act.callback_query_id, "Không tìm thấy lệnh đang mở")
-                    continue
-                pos = self._tracked_positions.get(pid)
-                mode_label = self._position_modes.get(pid, "")
-                if isinstance(self.broker, PaperBroker):
-                    closed = self.broker.close_position(pid, close_price=act.custom_price, reason="Đóng thủ công qua Telegram")
-                    if closed:
-                        account = self.broker.get_account_summary()
-                        self.risk_manager.record_trade_closed(closed.realized_pnl, account.balance)
-                        self._tracked_positions.pop(pid, None)
-                        self._position_modes.pop(pid, None)
-                        self._position_opened_at.pop(pid, None)
-                        self._position_opened_candle.pop(pid, None)
-                        self._position_mfe_price.pop(pid, None)
-                        self._position_exit_alerted.discard(pid)
-                        self._position_be_alerted.discard(pid)
-                        self._position_lock_alerted.discard(pid)
-                        if act.callback_query_id:
-                            self.notifier.answer_callback_query(act.callback_query_id, "Đã đóng lệnh!")
-                        if act.reply_to_message_id:
-                            self.notifier.clear_inline_buttons(act.reply_to_message_id)
-                        self.notifier.notify_position_closed(
-                            side=pos.side if pos else "",
-                            entry_price=pos.entry_price if pos else 0.0,
-                            close_price=closed.close_price,
-                            pnl_usd=closed.realized_pnl,
-                            balance=account.balance,
-                            position_id=pid,
-                            reason=closed.reason,
-                            mode_label=mode_label,
-                        )
+                state_changed |= self._handle_close_action(act)
+
+        if state_changed:
+            self._save_runtime_state()
+
+    def _handle_info_actions(
+        self,
+        candles_by_tf: Dict[str, List[Dict[str, Any]]],
+        bid: float,
+        ask: float,
+        spread: float,
+    ) -> None:
+        if not self._deferred_info_actions:
+            return
+        actions = list(self._deferred_info_actions)
+        self._deferred_info_actions.clear()
+        tz = timezone(timedelta(hours=self.cfg.telegram.heartbeat_tz_offset_hours))
+        mid = round((bid + ask) / 2.0, 2)
+
+        for act in actions:
+            if act.action == "help":
+                self.notifier.send_message(
+                    "<b>📖 LỆNH TELEGRAM HỖ TRỢ</b>\n"
+                    "• <code>/status</code> — Giá, số dư, lệnh đang mở & chỉ báo EMA/RSI/ADX\n"
+                    "• <code>/news</code> — Lịch tin USD High-Impact tuần này\n"
+                    "• <code>/pause</code> / <code>/resume</code> — Tạm dừng hoặc bật lại báo kèo mới\n"
+                    "• <code>/sl 3570.5</code> — Cập nhật mức SL bot đang theo dõi\n"
+                    "• Trả lời tín hiệu: <code>vào [giá]</code>, <code>bỏ</code>, <code>đóng [giá]</code>"
+                )
+            elif act.action == "news":
+                events = self.news_filter.upcoming_events(hours=168)
+                if not events:
+                    self.notifier.send_message("📅 Không có tin <b>USD High-Impact</b> sắp tới trong tuần này.")
                 else:
-                    if act.callback_query_id:
-                        self.notifier.answer_callback_query(act.callback_query_id, "Đã dừng theo dõi")
-                    self._tracked_positions.pop(pid, None)
-                    self._position_modes.pop(pid, None)
+                    lines = ["<b>📅 LỊCH TIN USD HIGH-IMPACT SẮP TỚI</b>"]
+                    for ev in events[:10]:
+                        dt_str = datetime.fromtimestamp(ev.timestamp_sec, tz=tz).strftime("%a %d/%m %H:%M VN")
+                        lines.append(f"• <code>{dt_str}</code> — {html.escape(ev.title)}")
+                    self.notifier.send_message("\n".join(lines))
+            elif act.action == "status":
+                account = self.broker.get_account_summary()
+                state_str = "⏸ TẠM DỪNG" if self._paused else "🟢 ĐANG CHẠY"
+                risk_str = f"{self.risk_manager.effective_risk_percent:.1f}%"
+                if self.risk_manager.consecutive_losses >= max(1, self.cfg.risk.loss_streak_reduce_after) and self.cfg.risk.loss_streak_reduce_after > 0:
+                    risk_str += f" (giảm sau {self.risk_manager.consecutive_losses} lệnh thua)"
+                lines = [
+                    f"<b>📊 TRẠNG THÁI BOT</b> ({state_str})",
+                    f"• Giá: <b>{mid:.2f}</b> (Spread ${spread:.2f}) | Balance: <b>${account.balance:,.2f}</b>",
+                    f"• Risk hiệu dụng: <b>{risk_str}</b> | Đang mở: <b>{len(self._tracked_positions)}</b>",
+                ]
+                for pid, pos in self._tracked_positions.items():
+                    mode_tag = self._position_modes.get(pid, "?")
+                    sl_txt = f"{pos.stop_loss:.2f}" if pos.stop_loss is not None else "—"
+                    tp_txt = f"{pos.take_profit:.2f}" if pos.take_profit is not None else "—"
+                    lines.append(
+                        f"  └ <code>{html.escape(pid)}</code> [{html.escape(mode_tag)}] {pos.side} @ <code>{pos.entry_price:.2f}</code> "
+                        f"| SL <code>{sl_txt}</code> / TP <code>{tp_txt}</code> (~<b>{pos.unrealized_pnl:+.2f}$</b>)"
+                    )
+                for prof in self.profiles:
+                    snap = summarize_market_state(
+                        candles_by_tf.get(prof.strategy.timeframe, []),
+                        prof.strategy,
+                        htf_candles=candles_by_tf.get(prof.strategy.htf_timeframe) if prof.strategy.htf_timeframe else None,
+                    )
+                    if snap:
+                        htf_txt = ""
+                        if snap.get("htf_bias") is not None:
+                            htf_map = {1: "TĂNG", -1: "GIẢM", 0: "TRUNG LẬP"}
+                            htf_txt = f" | {prof.strategy.htf_timeframe}: {htf_map.get(snap['htf_bias'], '?')}"
+                        sess_txt = "Trong phiên" if snap["in_session"] else "Ngoài phiên"
+                        lines.append(
+                            f"• <b>{html.escape(prof.name)}</b>: {snap['trend']} ({sess_txt}{htf_txt}) "
+                            f"| RSI <code>{snap['rsi']:.1f}</code> | ADX <code>{snap['adx']:.1f}</code> | ATR <code>${snap['atr']:.2f}</code>"
+                        )
+                self.notifier.send_message("\n".join(lines))
 
     def run_once(self) -> Optional[TradeSignal]:
         """Run one polling cycle across all configured strategy modes."""
         self._process_telegram_actions()
         candles_by_tf: Dict[str, List[Dict[str, Any]]] = {}
         for prof in self.profiles:
-            tf = prof.strategy.timeframe
-            if tf not in candles_by_tf:
-                candles_by_tf[tf] = self.broker.get_candles(tf, count=300)
+            for tf in (prof.strategy.timeframe, prof.strategy.htf_timeframe):
+                if tf and tf not in candles_by_tf:
+                    candles_by_tf[tf] = self.broker.get_candles(tf, count=300)
 
         quote = self.broker.get_quote()
         self._sync_positions(quote.mid)
         self._update_mfe(quote.mid)
         self._check_early_exits(candles_by_tf, quote.mid)
+        self._check_upcoming_news_for_open_positions()
+        self._maybe_send_weekend_warning()
+        self._handle_info_actions(candles_by_tf, quote.bid, quote.ask, quote.spread)
 
         triggered: Optional[TradeSignal] = None
-        for prof in self.profiles:
-            tf = prof.strategy.timeframe
-            res = self._evaluate_profile(
-                prof,
-                candles_by_tf.get(tf, []),
-                quote.bid,
-                quote.ask,
-                quote.spread,
-            )
-            if res is not None:
-                triggered = res
+        if not self._paused:
+            for prof in self.profiles:
+                tf = prof.strategy.timeframe
+                htf = prof.strategy.htf_timeframe
+                res = self._evaluate_profile(
+                    prof,
+                    candles_by_tf.get(tf, []),
+                    quote.bid,
+                    quote.ask,
+                    quote.spread,
+                    htf_candles=candles_by_tf.get(htf) if htf else None,
+                )
+                if res is not None:
+                    triggered = res
 
         self._maybe_send_heartbeat(quote.mid, quote.spread)
         return triggered
@@ -552,6 +878,22 @@ class TradingBot:
             else:
                 self._position_mfe_price[pid] = min(prev_mfe, current_price)
 
+    def _update_mfe_from_candles(self, candles_by_tf: Dict[str, List[Dict[str, Any]]]) -> None:
+        for tf in ("M1", "M5", "M15", "M30", "H1"):
+            bars = candles_by_tf.get(tf)
+            if not bars:
+                continue
+            latest_c = bars[-1]
+            latest_ts = int(latest_c["time"])
+            for pid, pos in self._tracked_positions.items():
+                opened_candle = self._position_opened_candle.get(pid, 0)
+                if latest_ts > opened_candle:
+                    prev_mfe = self._position_mfe_price.get(pid, pos.entry_price)
+                    if pos.side == "BUY":
+                        self._position_mfe_price[pid] = max(prev_mfe, float(latest_c["high"]))
+                    else:
+                        self._position_mfe_price[pid] = min(prev_mfe, float(latest_c["low"]))
+
     def _check_early_exits(
         self,
         candles_by_tf: Dict[str, List[Dict[str, Any]]],
@@ -560,33 +902,29 @@ class TradingBot:
     ) -> None:
         if not self._tracked_positions:
             return
-        exit_tf = "M5" if "M5" in candles_by_tf else self.profiles[0].strategy.timeframe
-        exit_candles = candles_by_tf.get(exit_tf, [])
-        if not exit_candles:
-            return
-        latest_c = exit_candles[-1]
-        latest_ts = int(latest_c["time"])
-        if self._last_exit_check_candle_time == latest_ts:
-            return
-        self._last_exit_check_candle_time = latest_ts
+        self._update_mfe_from_candles(candles_by_tf)
 
-        # Also update MFE from the latest closed candle high/low
-        for pid, pos in self._tracked_positions.items():
-            opened_candle = self._position_opened_candle.get(pid, 0)
-            if latest_ts > opened_candle:
-                prev_mfe = self._position_mfe_price.get(pid, pos.entry_price)
-                if pos.side == "BUY":
-                    self._position_mfe_price[pid] = max(prev_mfe, float(latest_c["high"]))
-                else:
-                    self._position_mfe_price[pid] = min(prev_mfe, float(latest_c["low"]))
-
-        exit_prof = next((p for p in self.profiles if p.strategy.timeframe == exit_tf), self.profiles[0])
+        profile_map = {p.name: p for p in self.profiles}
+        fallback_tf = "M5" if "M5" in candles_by_tf else self.profiles[0].strategy.timeframe
         now = int(now_sec if now_sec is not None else time.time())
         min_age_sec = max(0, self.cfg.risk.exit_alert_min_minutes) * 60
+        checked_new_tf: Dict[str, int] = {}
+        state_changed = False
 
-        for pid, pos in self._tracked_positions.items():
+        for pid, pos in list(self._tracked_positions.items()):
             if pid in self._position_exit_alerted:
                 continue
+            mode_label = self._position_modes.get(pid, "")
+            pos_prof = profile_map.get(mode_label, self.profiles[0])
+            eval_tf = pos_prof.strategy.timeframe if pos_prof.strategy.timeframe in candles_by_tf else fallback_tf
+            eval_candles = candles_by_tf.get(eval_tf, [])
+            if not eval_candles:
+                continue
+            latest_ts = int(eval_candles[-1]["time"])
+            if self._last_exit_check_candle_by_tf.get(eval_tf) == latest_ts:
+                continue
+            checked_new_tf[eval_tf] = latest_ts
+
             opened_at = self._position_opened_at.get(pid, now)
             if min_age_sec > 0 and (now - opened_at) < min_age_sec:
                 continue
@@ -596,34 +934,39 @@ class TradingBot:
                 current_sl=pos.stop_loss,
                 take_profit=pos.take_profit,
                 max_favorable_price=self._position_mfe_price.get(pid, pos.entry_price),
-                candles=exit_candles,
-                cfg=exit_prof.strategy,
+                candles=eval_candles,
+                cfg=pos_prof.strategy,
                 be_done=pid in self._position_be_alerted,
                 lock_done=pid in self._position_lock_alerted,
             )
             if advice is None:
                 continue
             age_min = max(0, (now - opened_at) // 60)
-            mode_label = self._position_modes.get(pid, exit_prof.name)
+            label = mode_label or pos_prof.name
             if advice.action == "close_now":
                 self._position_exit_alerted.add(pid)
-                logger.info("[%s] Close advice for %s: %s", mode_label, pid, advice.reason)
-                self.notifier.notify_close_warning(
+                state_changed = True
+                logger.info("[%s] Close advice for %s: %s", label, pid, advice.reason)
+                warn_id = self.notifier.notify_close_warning(
                     side=pos.side,
                     entry_price=pos.entry_price,
                     current_price=current_price,
                     unrealized_pnl=pos.unrealized_pnl,
                     reason=advice.reason,
                     age_minutes=age_min,
-                    mode_label=mode_label,
+                    mode_label=label,
+                    position_id=pid,
                 )
+                if isinstance(warn_id, int) and warn_id > 0:
+                    self._msg_to_position[warn_id] = pid
             elif advice.action in ("move_sl_be", "lock_profit") and advice.suggested_sl is not None:
                 if advice.action == "move_sl_be":
                     self._position_be_alerted.add(pid)
                 else:
                     self._position_lock_alerted.add(pid)
-                logger.info("[%s] Move SL advice (%s -> %.2f) for %s: %s", mode_label, advice.action, advice.suggested_sl, pid, advice.reason)
-                self.notifier.notify_move_sl_advice(
+                state_changed = True
+                logger.info("[%s] Move SL advice (%s -> %.2f) for %s: %s", label, advice.action, advice.suggested_sl, pid, advice.reason)
+                sl_msg_id = self.notifier.notify_move_sl_advice(
                     side=pos.side,
                     action=advice.action,
                     entry_price=pos.entry_price,
@@ -631,8 +974,59 @@ class TradingBot:
                     new_sl=advice.suggested_sl,
                     unrealized_pnl=pos.unrealized_pnl,
                     reason=advice.reason,
-                    mode_label=mode_label,
+                    mode_label=label,
+                    position_id=pid,
                 )
+                if isinstance(sl_msg_id, int) and sl_msg_id > 0:
+                    self._msg_to_position[sl_msg_id] = pid
+
+        self._last_exit_check_candle_by_tf.update(checked_new_tf)
+        if state_changed:
+            self._save_runtime_state()
+
+    def _check_upcoming_news_for_open_positions(self, now_sec: Optional[int] = None) -> bool:
+        warn_mins = self.cfg.risk.news_warn_before_minutes
+        if warn_mins <= 0 or not self._tracked_positions:
+            return False
+        now = int(now_sec if now_sec is not None else time.time())
+        upcoming = self.news_filter.upcoming_events(hours=2, now_sec=now)
+        tz = timezone(timedelta(hours=self.cfg.telegram.heartbeat_tz_offset_hours))
+        sent = False
+        for ev in upcoming:
+            mins_left = int((ev.timestamp_sec - now + 59) // 60)
+            if not (0 < (ev.timestamp_sec - now) <= warn_mins * 60):
+                continue
+            key = f"{ev.timestamp_sec}:{ev.title}"
+            if key in self._sent_news_warnings:
+                continue
+            if len(self._sent_news_warnings) > 32:
+                self._sent_news_warnings.clear()
+            self._sent_news_warnings.add(key)
+            dt_str = datetime.fromtimestamp(ev.timestamp_sec, tz=tz).strftime("%H:%M %d/%m VN")
+            self.notifier.notify_news_warning(ev.title, mins_left, len(self._tracked_positions), dt_str)
+            sent = True
+        if sent:
+            self._save_runtime_state()
+        return sent
+
+    def _maybe_send_weekend_warning(self, now_utc: Optional[datetime] = None) -> bool:
+        warn_hour = self.cfg.risk.friday_close_warn_utc_hour
+        if warn_hour < 0 or not self._tracked_positions:
+            return False
+        current_utc = now_utc or datetime.now(timezone.utc)
+        if current_utc.weekday() != 4 or current_utc.hour < warn_hour:
+            return False
+        key = current_utc.strftime("%Y-%m-%d")
+        if key in self._sent_weekend_warnings:
+            return False
+        if len(self._sent_weekend_warnings) > 16:
+            self._sent_weekend_warnings.clear()
+        self._sent_weekend_warnings.add(key)
+        tz = timezone(timedelta(hours=self.cfg.telegram.heartbeat_tz_offset_hours))
+        time_label_vn = current_utc.astimezone(tz).strftime("%H:%M %d/%m VN")
+        self.notifier.notify_weekend_warning(len(self._tracked_positions), time_label_vn)
+        self._save_runtime_state()
+        return True
 
     def _maybe_send_heartbeat(
         self, price: float, spread: float, now_utc: Optional[datetime] = None
@@ -682,6 +1076,7 @@ class TradingBot:
             spread_usd=spread,
             extra=extra or None,
         )
+        self._save_runtime_state()
         return True
 
     def status_snapshot(self) -> Dict[str, Any]:
@@ -689,6 +1084,8 @@ class TradingBot:
             "symbol": self.broker.symbol,
             "modes": [p.name for p in self.profiles],
             "open_positions": len(self._tracked_positions),
+            "paused": self._paused,
+            "consecutive_losses": self.risk_manager.consecutive_losses,
         }
 
     def run_forever(self) -> None:
@@ -734,16 +1131,7 @@ def main() -> None:
 
     cfg = load_config(args.env)
     if args.dry_run:
-        cfg = BotConfig(
-            strategy=cfg.strategy,
-            risk=cfg.risk,
-            broker=cfg.broker,
-            telegram=cfg.telegram,
-            poll_interval_seconds=cfg.poll_interval_seconds,
-            dry_run=True,
-            log_level=cfg.log_level,
-            strategy_profiles=cfg.strategy_profiles,
-        )
+        cfg = replace(cfg, dry_run=True)
 
     logging.basicConfig(
         level=getattr(logging, cfg.log_level, logging.INFO),

@@ -71,6 +71,101 @@ def is_in_trading_session(timestamp_sec: int, cfg: StrategyConfig) -> bool:
     return hour >= cfg.session_start_utc or hour < cfg.session_end_utc
 
 
+def timeframe_seconds(tf: str) -> int:
+    """Return candle duration in seconds for a timeframe code."""
+    return {
+        "M1": 60,
+        "M5": 300,
+        "M15": 900,
+        "M30": 1800,
+        "H1": 3600,
+        "H4": 14400,
+        "D1": 86400,
+    }.get(tf.upper(), 3600)
+
+
+def compute_htf_bias_series(
+    ltf_candles: Sequence[Dict[str, Any]],
+    ltf_timeframe: str,
+    htf_candles: Sequence[Dict[str, Any]],
+    htf_timeframe: str,
+    ema_fast_period: int = 20,
+    ema_slow_period: int = 50,
+) -> List[int]:
+    """
+    Compute non-repainting higher-timeframe trend direction aligned to each LTF candle close:
+      +1 = bullish (HTF EMA fast > slow and HTF close > slow)
+      -1 = bearish (HTF EMA fast < slow and HTF close < slow)
+       0 = neutral / mixed (blocks counter-chop entries)
+    """
+    if not ltf_candles or not htf_candles:
+        return [0] * len(ltf_candles)
+    htf_closes = [float(c["close"]) for c in htf_candles]
+    htf_fast = ema_series(htf_closes, ema_fast_period)
+    htf_slow = ema_series(htf_closes, ema_slow_period)
+    ltf_sec = timeframe_seconds(ltf_timeframe)
+    htf_sec = timeframe_seconds(htf_timeframe)
+
+    biases: List[int] = []
+    j = -1
+    n_htf = len(htf_candles)
+    min_htf_idx = max(ema_slow_period, 5)
+    for c in ltf_candles:
+        ltf_close_ts = int(c["time"]) + ltf_sec
+        while j + 1 < n_htf and int(htf_candles[j + 1]["time"]) + htf_sec <= ltf_close_ts:
+            j += 1
+        if j < min_htf_idx:
+            biases.append(0)
+            continue
+        c_htf = htf_closes[j]
+        f_htf = htf_fast[j]
+        s_htf = htf_slow[j]
+        if f_htf > s_htf and c_htf > s_htf:
+            biases.append(1)
+        elif f_htf < s_htf and c_htf < s_htf:
+            biases.append(-1)
+        else:
+            biases.append(0)
+    return biases
+
+
+def summarize_market_state(
+    candles: Sequence[Dict[str, Any]],
+    cfg: StrategyConfig,
+    htf_candles: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Return latest closed candle indicator snapshot for Telegram /status reporting."""
+    if not candles:
+        return {}
+    cache = compute_indicators(candles, cfg)
+    idx = len(candles) - 1
+    c = candles[idx]
+    ema_f = cache.ema_fast[idx]
+    ema_s = cache.ema_slow[idx]
+    htf_bias: Optional[int] = None
+    if cfg.htf_timeframe and htf_candles:
+        htf_bias = compute_htf_bias_series(
+            [c],
+            cfg.timeframe,
+            htf_candles,
+            cfg.htf_timeframe,
+            cfg.htf_ema_fast,
+            cfg.htf_ema_slow,
+        )[0]
+    trend = "TĂNG" if ema_f > ema_s else ("GIẢM" if ema_f < ema_s else "NGANG")
+    return {
+        "close": float(c["close"]),
+        "ema_fast": ema_f,
+        "ema_slow": ema_s,
+        "rsi": cache.rsi[idx],
+        "adx": cache.adx[idx],
+        "atr": cache.atr[idx],
+        "trend": trend,
+        "in_session": is_in_trading_session(int(c["time"]), cfg),
+        "htf_bias": htf_bias,
+    }
+
+
 def _compute_sl_tp_distances(atr_val: float, cfg: StrategyConfig):
     """Compute ATR-based SL/TP distances bounded by optional USD caps."""
     sl_dist = cfg.sl_atr_mult * atr_val
@@ -106,6 +201,7 @@ class TrendPullbackStrategy:
         candles: Sequence[Dict[str, Any]],
         index: int,
         cache: IndicatorCache,
+        htf_bias: Optional[int] = None,
     ) -> Optional[TradeSignal]:
         """Evaluate signal at a specific closed candle index."""
         cfg = self.cfg
@@ -147,9 +243,12 @@ class TrendPullbackStrategy:
             "atr": round(atr_val, 3),
             "adx": round(adx_val, 2),
         }
+        if htf_bias is not None:
+            indicators["htf_bias"] = float(htf_bias)
 
         # --- LONG (BUY) ---
-        bull_trend = ema_f > ema_s and ema_f > ema_f_prev and close_p > ema_f
+        bull_htf_ok = htf_bias is None or htf_bias == 1
+        bull_trend = bull_htf_ok and ema_f > ema_s and ema_f > ema_f_prev and close_p > ema_f
         if bull_trend:
             pulled_back = any(
                 float(c["low"]) <= cache.ema_fast[lookback_start + offset] + tol
@@ -181,7 +280,8 @@ class TrendPullbackStrategy:
                 )
 
         # --- SHORT (SELL) ---
-        bear_trend = ema_f < ema_s and ema_f < ema_f_prev and close_p < ema_f
+        bear_htf_ok = htf_bias is None or htf_bias == -1
+        bear_trend = bear_htf_ok and ema_f < ema_s and ema_f < ema_f_prev and close_p < ema_f
         if bear_trend:
             pulled_back = any(
                 float(c["high"]) >= cache.ema_fast[lookback_start + offset] - tol
@@ -214,12 +314,26 @@ class TrendPullbackStrategy:
 
         return None
 
-    def evaluate_latest(self, candles: Sequence[Dict[str, Any]]) -> Optional[TradeSignal]:
+    def evaluate_latest(
+        self,
+        candles: Sequence[Dict[str, Any]],
+        htf_candles: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Optional[TradeSignal]:
         """Evaluate the most recent closed candle."""
         if len(candles) <= self.min_candles:
             return None
         cache = compute_indicators(candles, self.cfg)
-        return self.evaluate_at(candles, len(candles) - 1, cache)
+        htf_bias: Optional[int] = None
+        if self.cfg.htf_timeframe and htf_candles:
+            htf_bias = compute_htf_bias_series(
+                [candles[-1]],
+                self.cfg.timeframe,
+                htf_candles,
+                self.cfg.htf_timeframe,
+                self.cfg.htf_ema_fast,
+                self.cfg.htf_ema_slow,
+            )[0]
+        return self.evaluate_at(candles, len(candles) - 1, cache, htf_bias=htf_bias)
 
 
 def evaluate_trade_management(

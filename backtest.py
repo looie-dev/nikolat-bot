@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from config import StrategyConfig
-from strategy import TrendPullbackStrategy, compute_indicators
+from strategy import TrendPullbackStrategy, compute_htf_bias_series, compute_indicators
 
 
 @dataclass
@@ -45,9 +45,22 @@ def run_backtest(
     cfg: StrategyConfig,
     spread_usd: float = 0.30,
     cooldown_candles: int = 2,
+    htf_candles: Optional[List[Dict[str, Any]]] = None,
 ) -> BacktestMetrics:
     strategy = TrendPullbackStrategy(cfg)
     cache = compute_indicators(candles, cfg)
+    htf_biases = (
+        compute_htf_bias_series(
+            candles,
+            cfg.timeframe,
+            htf_candles,
+            cfg.htf_timeframe,
+            cfg.htf_ema_fast,
+            cfg.htf_ema_slow,
+        )
+        if cfg.htf_timeframe and htf_candles
+        else None
+    )
 
     r_results: List[float] = []
     open_trade: Optional[Dict[str, Any]] = None
@@ -102,7 +115,12 @@ def run_backtest(
         if i < cooldown_until:
             continue
 
-        sig = strategy.evaluate_at(candles, i, cache)
+        sig = strategy.evaluate_at(
+            candles,
+            i,
+            cache,
+            htf_bias=htf_biases[i] if htf_biases is not None else None,
+        )
         if sig is None:
             continue
 

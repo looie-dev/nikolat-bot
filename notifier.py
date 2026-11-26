@@ -17,11 +17,13 @@ logger = logging.getLogger(__name__)
 _ENTER_RE = re.compile(r"^(?:vào|vao|đã vào|da vao|enter|ok|in|1)(?:\s+([0-9]+(?:\.[0-9]+)?))?$")
 _SKIP_RE = re.compile(r"^(?:bỏ|bo|bỏ qua|bo qua|skip|no|0)$")
 _CLOSE_RE = re.compile(r"^(?:đóng|dong|đã đóng|da dong|close|exit|out)(?:\s+([0-9]+(?:\.[0-9]+)?))?$")
+_SL_RE = re.compile(r"^/?sl(?:@[a-z0-9_]+)?\s+([0-9]+(?:\.[0-9]+)?)$")
+_CMD_RE = re.compile(r"^/?(status|news|pause|resume|help)(?:@[a-z0-9_]+)?$")
 
 
 @dataclass(frozen=True)
 class TelegramUserAction:
-    action: str  # "enter", "skip", or "close"
+    action: str  # "enter", "skip", "close", "movesl", "status", "news", "pause", "resume", "help"
     target_id: str = ""
     reply_to_message_id: Optional[int] = None
     callback_query_id: Optional[str] = None
@@ -29,7 +31,7 @@ class TelegramUserAction:
 
 
 def parse_telegram_text_command(text: str) -> Optional[Tuple[str, Optional[float]]]:
-    """Parse short Vietnamese/English Telegram replies like 'vào', 'vào 3501.2', 'bỏ', 'đóng'."""
+    """Parse short Vietnamese/English Telegram replies and slash commands."""
     cleaned = " ".join((text or "").strip().lower().split())
     if not cleaned:
         return None
@@ -43,6 +45,12 @@ def parse_telegram_text_command(text: str) -> Optional[Tuple[str, Optional[float
     if m_close:
         price = float(m_close.group(1)) if m_close.group(1) else None
         return ("close", price)
+    m_sl = _SL_RE.match(cleaned)
+    if m_sl:
+        return ("movesl", float(m_sl.group(1)))
+    m_cmd = _CMD_RE.match(cleaned)
+    if m_cmd:
+        return (m_cmd.group(1), None)
     return None
 
 
@@ -159,14 +167,29 @@ class TelegramNotifier:
                     continue
                 raw_data = str(cb.get("data", ""))
                 if ":" in raw_data:
-                    act, _, target_id = raw_data.partition(":")
-                    if act in ("enter", "skip", "close"):
+                    parts = raw_data.split(":")
+                    act = parts[0]
+                    if act in ("enter", "skip", "close") and len(parts) >= 2:
                         actions.append(
                             TelegramUserAction(
                                 action=act,
-                                target_id=target_id,
+                                target_id=":".join(parts[1:]),
                                 reply_to_message_id=cb_msg.get("message_id"),
                                 callback_query_id=cb.get("id"),
+                            )
+                        )
+                    elif act == "movesl" and len(parts) == 3:
+                        try:
+                            new_sl = float(parts[2])
+                        except ValueError:
+                            continue
+                        actions.append(
+                            TelegramUserAction(
+                                action="movesl",
+                                target_id=parts[1],
+                                reply_to_message_id=cb_msg.get("message_id"),
+                                callback_query_id=cb.get("id"),
+                                custom_price=new_sl,
                             )
                         )
                 continue
@@ -316,14 +339,22 @@ class TelegramNotifier:
         reason: str,
         age_minutes: int,
         mode_label: str = "",
-    ) -> bool:
+        position_id: str = "",
+    ) -> Optional[int]:
         mode_tag = f" [{html.escape(mode_label)}]" if mode_label else ""
         msg = (
             f"<b>⚠️ NÊN ĐÓNG LỆNH — XAUUSD {side}{mode_tag}</b>\n"
             f"• Vào: <code>{entry_price:.2f}</code> → Hiện tại: <code>{current_price:.2f}</code> (~<b>{unrealized_pnl:+.2f}$</b>)\n"
             f"• Lý do: {html.escape(reason)}"
         )
-        return self.send_message(msg)
+        markup = None
+        if position_id:
+            markup = {
+                "inline_keyboard": [
+                    [{"text": "🔒", "callback_data": f"close:{position_id}"}]
+                ]
+            }
+        return self.send_message_with_id(msg, reply_markup=markup)
 
     def notify_move_sl_advice(
         self,
@@ -335,13 +366,45 @@ class TelegramNotifier:
         unrealized_pnl: float,
         reason: str,
         mode_label: str = "",
-    ) -> bool:
+        position_id: str = "",
+    ) -> Optional[int]:
         mode_tag = f" [{html.escape(mode_label)}]" if mode_label else ""
         title = "🎯 NÊN DỜI SL KHOÁ LỜI" if action == "lock_profit" else "🛡 NÊN DỜI SL HOÀ VỐN"
         msg = (
             f"<b>{title} — XAUUSD {side}{mode_tag}</b>\n"
             f"• SL mới: <code>{new_sl:.2f}</code> (hiện tại: <code>{current_price:.2f}</code> | ~<b>{unrealized_pnl:+.2f}$</b>)\n"
             f"• Lý do: {html.escape(reason)}"
+        )
+        markup = None
+        if position_id:
+            markup = {
+                "inline_keyboard": [
+                    [
+                        {"text": "🛡", "callback_data": f"movesl:{position_id}:{new_sl:.2f}"},
+                        {"text": "🔒", "callback_data": f"close:{position_id}"},
+                    ]
+                ]
+            }
+        return self.send_message_with_id(msg, reply_markup=markup)
+
+    def notify_news_warning(
+        self,
+        title: str,
+        minutes_left: int,
+        open_count: int,
+        time_label_vn: str,
+    ) -> bool:
+        msg = (
+            f"<b>⏰ SẮP RA TIN USD MẠNH (~{minutes_left} phút)</b>\n"
+            f"• Tin: <b>{html.escape(title)}</b> ({html.escape(time_label_vn)})\n"
+            f"• Bạn đang mở <b>{open_count}</b> lệnh — cân nhắc dời SL về hòa vốn hoặc chốt bớt."
+        )
+        return self.send_message(msg)
+
+    def notify_weekend_warning(self, open_count: int, time_label_vn: str) -> bool:
+        msg = (
+            f"<b>🌙 SẮP ĐÓNG CỬA CUỐI TUẦN ({html.escape(time_label_vn)})</b>\n"
+            f"• Bạn đang giữ <b>{open_count}</b> lệnh mở — cân nhắc chốt hoặc siết SL để tránh gap đầu tuần & giãn spread."
         )
         return self.send_message(msg)
 

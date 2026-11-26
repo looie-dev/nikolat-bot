@@ -36,6 +36,8 @@ class RiskManager:
         max_spread_usd: float,
         fixed_size: float = 0.0,
         max_size: float = 0.0,
+        loss_streak_reduce_after: int = 2,
+        loss_streak_risk_factor: float = 0.5,
     ):
         self.risk_percent = risk_percent
         self.max_open_positions = max_open_positions
@@ -44,11 +46,47 @@ class RiskManager:
         self.max_spread_usd = max_spread_usd
         self.fixed_size = fixed_size
         self.max_size = max_size
+        self.loss_streak_reduce_after = loss_streak_reduce_after
+        self.loss_streak_risk_factor = loss_streak_risk_factor
 
         self._current_day: Optional[str] = None
         self._daily_trades: int = 0
         self._daily_realized_pnl: float = 0.0
         self._day_start_balance: Optional[float] = None
+        self._consecutive_losses: int = 0
+
+    @property
+    def consecutive_losses(self) -> int:
+        return self._consecutive_losses
+
+    @property
+    def effective_risk_percent(self) -> float:
+        if (
+            self.loss_streak_reduce_after > 0
+            and 0.0 < self.loss_streak_risk_factor < 1.0
+            and self._consecutive_losses >= self.loss_streak_reduce_after
+        ):
+            return self.risk_percent * self.loss_streak_risk_factor
+        return self.risk_percent
+
+    def export_state(self) -> dict:
+        return {
+            "current_day": self._current_day,
+            "daily_trades": self._daily_trades,
+            "daily_realized_pnl": self._daily_realized_pnl,
+            "day_start_balance": self._day_start_balance,
+            "consecutive_losses": self._consecutive_losses,
+        }
+
+    def restore_state(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        self._current_day = data.get("current_day")
+        self._daily_trades = int(data.get("daily_trades", 0))
+        self._daily_realized_pnl = float(data.get("daily_realized_pnl", 0.0))
+        dsb = data.get("day_start_balance")
+        self._day_start_balance = float(dsb) if dsb is not None else None
+        self._consecutive_losses = int(data.get("consecutive_losses", 0))
 
     def _roll_day_if_needed(self, balance: float, now_utc: Optional[datetime] = None) -> None:
         now = now_utc or datetime.now(timezone.utc)
@@ -68,6 +106,10 @@ class RiskManager:
     ) -> None:
         self._roll_day_if_needed(balance, now_utc)
         self._daily_realized_pnl += pnl_usd
+        if pnl_usd < 0:
+            self._consecutive_losses += 1
+        elif pnl_usd > 0:
+            self._consecutive_losses = 0
 
     def evaluate_order(
         self,
@@ -132,7 +174,7 @@ class RiskManager:
             actual_risk = round(size * sl_distance * spec.contract_size, 2)
             return RiskDecision(True, size, actual_risk, "OK (Fixed Size)")
 
-        target_risk_usd = balance * (self.risk_percent / 100.0)
+        target_risk_usd = balance * (self.effective_risk_percent / 100.0)
         raw_size = target_risk_usd / (sl_distance * spec.contract_size)
 
         # Round down to valid step size so actual risk never exceeds target_risk_usd

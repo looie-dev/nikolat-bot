@@ -19,12 +19,12 @@ Kết hợp các bộ lọc hiệu quả đã kiểm chứng trên XAUUSD:
 - **Xác định xu hướng (`EMA 50 / EMA 200`):** Chỉ BUY khi `EMA50 > EMA200` và `EMA50` đang dốc lên; chỉ SELL khi `EMA50 < EMA200` và `EMA50` đang dốc xuống.
 - **Điểm vào Pullback:** Giá hồi về vùng `EMA50` trong vòng 5 nến gần nhất rồi đóng nến xác nhận quay lại xu hướng.
 - **Động lượng (`RSI 14` + `MACD 12,26,9`):** RSI nằm trong vùng lành mạnh (`40–68` cho BUY, `32–60` cho SELL) và đang quay đầu đúng hướng + MACD Histogram cắt/móc theo xu hướng.
-- **SL / TP động thuần theo `ATR(14)`:** Mặc định `STRATEGY_MODES=m5_scalp,m15_intraday` dùng `m5_scalp` (`EMA 50/200`, `SL = 1.2 × ATR`, `RR 1:1.7`) và `m15_intraday` (`EMA 20/50`, `ADX >= 18`, `SL = 1.0 × ATR`, `RR 1:2.0`), lọc phiên `07:00–17:00 UTC`. Có tuỳ chọn giới hạn `MIN_SL_USD`/`MAX_SL_USD`/`MAX_TP_USD` nếu cần.
-- **Chạy đa chế độ (`STRATEGY_MODES`):** Hỗ trợ chạy đồng thời cả 2 mode trong cùng 1 tiến trình, mỗi mode giữ tối đa 1 lệnh riêng và tự chống mở lệnh ngược chiều nếu không bật hedging.
-- **Bộ lọc an toàn:**
-  - Chặn vào lệnh mới trong vòng `±15 phút` quanh tin kinh tế **USD High-Impact** (CPI, NFP, FOMC...).
-  - Chặn khi **spread** vượt quá `MAX_SPREAD_USD` (mặc định `$0.60`).
-  - Tính khối lượng tự động theo `RISK_PERCENT` (`1.0%` balance/lệnh), giới hạn số lệnh/ngày và lỗ tối đa/ngày.
+- **SL / TP động thuần theo `ATR(14)`:** Mặc định `STRATEGY_MODES=m5_scalp,m15_intraday` dùng `m5_scalp` (`EMA 50/200`, `ADX >= 15`, lọc xu hướng khung lớn `M15 EMA 20/50`, `SL = 1.2 × ATR`, `RR 1:1.7`) và `m15_intraday` (`EMA 20/50`, `ADX >= 18`, `SL = 1.0 × ATR`, `RR 1:2.0`), lọc phiên `07:00–17:00 UTC`.
+- **Theo dõi lệnh thủ công & Quản lý lệnh thông minh:** Bấm nút `✅` / `🛡` / `🔒` hoặc dùng các lệnh Telegram (`/status`, `/news`, `/pause`, `/resume`, `/sl <giá>`, `vào <giá>`, `đóng <giá>`).
+- **Bộ lọc an toàn & Quản lý vốn:**
+  - Chặn mở lệnh mới `±15 phút` quanh tin **USD High-Impact** và nhắc trước `30 phút` khi đang giữ lệnh mở; nhắc cuối tuần vào tối thứ Sáu.
+  - Chặn khi **spread** vượt `MAX_SPREAD_USD`, tự giảm phân nửa risk sau chuỗi thua liên tiếp (`LOSS_STREAK_REDUCE_AFTER=2`).
+  - Lưu trạng thái bền vững ra JSON (`state_store.py`) và hỗ trợ đồng bộ qua Upstash Redis REST nếu chạy Render Free Tier.
 
 ## 2. Cấu trúc thư mục
 

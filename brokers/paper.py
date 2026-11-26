@@ -17,6 +17,7 @@ from brokers.base import (
 )
 from config import BrokerConfig
 from risk_manager import InstrumentSpec
+from state_store import load_json_state, save_json_state
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +76,19 @@ class PaperBroker(BrokerClient):
         return self._spec
 
     def _load_state(self) -> Dict[str, Any]:
-        if self._state_path.exists():
-            return json.loads(self._state_path.read_text(encoding="utf-8"))
-        return {
-            "balance": float(self.cfg.paper_initial_balance),
-            "next_id": 1,
-            "open_positions": [],
-            "closed_trades": {},
-        }
+        return load_json_state(
+            self._state_path,
+            default_factory=lambda: {
+                "balance": float(self.cfg.paper_initial_balance),
+                "next_id": 1,
+                "open_positions": [],
+                "closed_trades": {},
+            },
+            remote_key=f"paper:{self._state_path.name}",
+        )
 
     def _save_state(self) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        self._state_path.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+        save_json_state(self._state_path, self._state, remote_key=f"paper:{self._state_path.name}")
 
     def _fetch_yahoo_candles(self, timeframe: str, count: int) -> List[Dict[str, Any]]:
         interval, rng = _YF_INTERVAL.get(timeframe.upper(), ("15m", "1mo"))

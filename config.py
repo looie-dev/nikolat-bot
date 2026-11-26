@@ -66,6 +66,9 @@ class StrategyConfig:
     session_end_utc: int = 17    # London/NY overlap end
     use_session_filter: bool = True
     breakeven_atr_trigger: float = 0.0  # Move SL to entry after +N ATR (0 disables)
+    htf_timeframe: str = ""             # Optional higher-TF trend filter (e.g. "M15", "H1")
+    htf_ema_fast: int = 20
+    htf_ema_slow: int = 50
 
 
 @dataclass(frozen=True)
@@ -97,13 +100,16 @@ STRATEGY_PRESETS: Dict[str, StrategyConfig] = {
         timeframe="M5",
         ema_fast=50,
         ema_slow=200,
-        adx_min=0.0,
+        adx_min=15.0,
         sl_atr_mult=1.2,
         rr_ratio=1.7,
         min_sl_usd=0.0,
         max_sl_usd=0.0,
         max_tp_usd=0.0,
         use_session_filter=True,
+        htf_timeframe="M15",
+        htf_ema_fast=20,
+        htf_ema_slow=50,
     ),
     "m15_intraday": StrategyConfig(
         timeframe="M15",
@@ -134,6 +140,10 @@ class RiskConfig:
     max_size: float = 0.0
     max_positions_per_mode: int = 1
     exit_alert_min_minutes: int = 0
+    news_warn_before_minutes: int = 30
+    loss_streak_reduce_after: int = 2
+    loss_streak_risk_factor: float = 0.5
+    friday_close_warn_utc_hour: int = 20
 
 
 @dataclass(frozen=True)
@@ -179,6 +189,7 @@ class BotConfig:
     log_level: str = "INFO"
     strategy_profiles: Tuple[StrategyProfile, ...] = ()
     manual_confirm_tracking: bool = False
+    bot_state_file: str = ""
 
     @property
     def active_profiles(self) -> Tuple[StrategyProfile, ...]:
@@ -208,6 +219,9 @@ def load_config(env_path: str = ".env") -> BotConfig:
         session_end_utc=_env_int("SESSION_END_UTC", 17),
         use_session_filter=_env_bool("USE_SESSION_FILTER", True),
         breakeven_atr_trigger=_env_float("BREAKEVEN_ATR_TRIGGER", 0.0),
+        htf_timeframe=os.environ.get("HTF_TIMEFRAME", "").strip().upper(),
+        htf_ema_fast=_env_int("HTF_EMA_FAST", 20),
+        htf_ema_slow=_env_int("HTF_EMA_SLOW", 50),
     )
     modes_raw = os.environ.get("STRATEGY_MODES", "").strip()
     profiles: Tuple[StrategyProfile, ...] = ()
@@ -234,6 +248,10 @@ def load_config(env_path: str = ".env") -> BotConfig:
         max_size=_env_float("MAX_SIZE", 0.0),
         max_positions_per_mode=_env_int("MAX_POSITIONS_PER_MODE", 1),
         exit_alert_min_minutes=_env_int("EXIT_ALERT_MIN_MINUTES", 0),
+        news_warn_before_minutes=_env_int("NEWS_WARN_BEFORE_MINUTES", 30),
+        loss_streak_reduce_after=_env_int("LOSS_STREAK_REDUCE_AFTER", 2),
+        loss_streak_risk_factor=_env_float("LOSS_STREAK_RISK_FACTOR", 0.5),
+        friday_close_warn_utc_hour=_env_int("FRIDAY_CLOSE_WARN_UTC_HOUR", 20),
     )
     broker = BrokerConfig(
         provider=os.environ.get("BROKER_PROVIDER", "paper").strip().lower(),
@@ -270,4 +288,5 @@ def load_config(env_path: str = ".env") -> BotConfig:
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         strategy_profiles=profiles,
         manual_confirm_tracking=_env_bool("MANUAL_CONFIRM_TRACKING", True),
+        bot_state_file=os.environ.get("BOT_STATE_FILE", "").strip(),
     )
