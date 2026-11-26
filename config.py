@@ -71,7 +71,6 @@ class StrategyConfig:
     htf_ema_slow: int = 50
     strategy_type: str = "trend_pullback"  # "trend_pullback" or "ict"
     ict_killzones_utc: Tuple[Tuple[int, int], ...] = ((7, 10), (12, 16))
-    ict_entry_mode: str = "mss_fvg"        # "mss_fvg" or "fvg_retest"
 
 
 @dataclass(frozen=True)
@@ -81,54 +80,6 @@ class StrategyProfile:
 
 
 STRATEGY_PRESETS: Dict[str, StrategyConfig] = {
-    "h1_swing": StrategyConfig(
-        timeframe="H1",
-        ema_fast=50,
-        ema_slow=200,
-        adx_min=0.0,
-        sl_atr_mult=2.5,
-        rr_ratio=2.5,
-        use_session_filter=True,
-    ),
-    "m15_active": StrategyConfig(
-        timeframe="M15",
-        ema_fast=20,
-        ema_slow=50,
-        adx_min=18.0,
-        sl_atr_mult=2.5,
-        rr_ratio=2.0,
-        use_session_filter=False,
-    ),
-    "m5_scalp": StrategyConfig(
-        timeframe="M5",
-        ema_fast=50,
-        ema_slow=200,
-        adx_min=15.0,
-        sl_atr_mult=1.2,
-        rr_ratio=1.7,
-        min_sl_usd=0.0,
-        max_sl_usd=0.0,
-        max_tp_usd=0.0,
-        use_session_filter=True,
-        htf_timeframe="H1",
-        htf_ema_fast=20,
-        htf_ema_slow=50,
-    ),
-    "m15_intraday": StrategyConfig(
-        timeframe="M15",
-        ema_fast=20,
-        ema_slow=50,
-        adx_min=18.0,
-        sl_atr_mult=1.0,
-        rr_ratio=2.0,
-        min_sl_usd=0.0,
-        max_sl_usd=0.0,
-        max_tp_usd=0.0,
-        use_session_filter=True,
-        htf_timeframe="H1",
-        htf_ema_fast=20,
-        htf_ema_slow=50,
-    ),
     "ict_intraday": StrategyConfig(
         strategy_type="ict",
         timeframe="M5",
@@ -144,7 +95,21 @@ STRATEGY_PRESETS: Dict[str, StrategyConfig] = {
         htf_ema_fast=20,
         htf_ema_slow=50,
         ict_killzones_utc=((7, 10), (12, 16)),
-        ict_entry_mode="mss_fvg",
+    ),
+    "m15_intraday": StrategyConfig(
+        timeframe="M15",
+        ema_fast=20,
+        ema_slow=50,
+        adx_min=18.0,
+        sl_atr_mult=1.0,
+        rr_ratio=2.0,
+        min_sl_usd=0.0,
+        max_sl_usd=0.0,
+        max_tp_usd=0.0,
+        use_session_filter=True,
+        htf_timeframe="H1",
+        htf_ema_fast=20,
+        htf_ema_slow=50,
     ),
 }
 

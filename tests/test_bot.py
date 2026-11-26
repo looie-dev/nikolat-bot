@@ -191,6 +191,7 @@ class TestStrategy(unittest.TestCase):
         return candles
 
     def test_ict_intraday_sweep_mss_fvg_and_filters(self):
+        self.assertEqual(set(STRATEGY_PRESETS.keys()), {"ict_intraday", "m15_intraday"})
         candles = self._build_ict_bull_sweep_candles()
         h1_bull = _make_candles([3400.0 + i * 1.5 for i in range(70)], start_ts=candles[-1]["time"] - 69 * 3600, step=3600, spread=2.0)
         h1_bear = _make_candles([3700.0 - i * 1.5 for i in range(70)], start_ts=candles[-1]["time"] - 69 * 3600, step=3600, spread=2.0)
