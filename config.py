@@ -122,6 +122,9 @@ STRATEGY_PRESETS: Dict[str, StrategyConfig] = {
         max_sl_usd=0.0,
         max_tp_usd=0.0,
         use_session_filter=True,
+        htf_timeframe="H1",
+        htf_ema_fast=20,
+        htf_ema_slow=50,
     ),
 }
 
