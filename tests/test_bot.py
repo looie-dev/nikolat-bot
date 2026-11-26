@@ -881,8 +881,11 @@ class TestBrokersAndBotLoop(unittest.TestCase):
         self.assertEqual(rm.effective_risk_percent, 10.0)
         rm.record_trade_closed(-5.0, 100.0)
         self.assertEqual(rm.effective_risk_percent, 5.0)
-        # Halved risk: $5 / (5 * 100) = 0.01 lot
+        # Halved risk: $5 / (5 * 100) = 0.01 lot; and $66 balance with $9 SL still allows min_size=0.01
         self.assertEqual(rm.evaluate_order(100.0, 3500.0, 3495.0, 0.40, 0, spec).size, 0.01)
+        dec_min_floor = rm.evaluate_order(66.0, 3500.0, 3491.0, 0.40, 0, spec)
+        self.assertTrue(dec_min_floor.allowed)
+        self.assertEqual(dec_min_floor.size, 0.01)
         rm.record_trade_closed(+10.0, 110.0)
         self.assertEqual(rm.consecutive_losses, 0)
         self.assertEqual(rm.effective_risk_percent, 10.0)

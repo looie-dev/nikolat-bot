@@ -19,7 +19,7 @@ Kết hợp các bộ lọc hiệu quả đã kiểm chứng trên XAUUSD:
 - **Xác định xu hướng (`EMA 50 / EMA 200`):** Chỉ BUY khi `EMA50 > EMA200` và `EMA50` đang dốc lên; chỉ SELL khi `EMA50 < EMA200` và `EMA50` đang dốc xuống.
 - **Điểm vào Pullback:** Giá hồi về vùng `EMA50` trong vòng 5 nến gần nhất rồi đóng nến xác nhận quay lại xu hướng.
 - **Động lượng (`RSI 14` + `MACD 12,26,9`):** RSI nằm trong vùng lành mạnh (`40–68` cho BUY, `32–60` cho SELL) và đang quay đầu đúng hướng + MACD Histogram cắt/móc theo xu hướng.
-- **SL / TP động thuần theo `ATR(14)`:** Mặc định `STRATEGY_MODES=m5_scalp,m15_intraday` dùng `m5_scalp` (`EMA 50/200`, `ADX >= 15`, lọc xu hướng khung lớn `M15 EMA 20/50`, `SL = 1.2 × ATR`, `RR 1:1.7`) và `m15_intraday` (`EMA 20/50`, `ADX >= 18`, `SL = 1.0 × ATR`, `RR 1:2.0`), lọc phiên `07:00–17:00 UTC`.
+- **SL / TP động thuần theo `ATR(14)`:** Mặc định `STRATEGY_MODES=m5_scalp,m15_intraday` dùng `m5_scalp` (`EMA 50/200`, `ADX >= 15`, lọc xu hướng khung lớn `H1 EMA 20/50`, `SL = 1.2 × ATR`, `RR 1:1.7`) và `m15_intraday` (`EMA 20/50`, `ADX >= 18`, `SL = 1.0 × ATR`, `RR 1:2.0`), lọc phiên `07:00–17:00 UTC`.
 - **Theo dõi lệnh thủ công & Quản lý lệnh thông minh:** Bấm nút `✅` / `🛡` / `🔒` hoặc dùng các lệnh Telegram (`/status`, `/news`, `/pause`, `/resume`, `/sl <giá>`, `vào <giá>`, `đóng <giá>`).
 - **Bộ lọc an toàn & Quản lý vốn:**
   - Chặn mở lệnh mới `±15 phút` quanh tin **USD High-Impact** và nhắc trước `30 phút` khi đang giữ lệnh mở; nhắc cuối tuần vào tối thứ Sáu.

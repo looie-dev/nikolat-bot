@@ -174,6 +174,7 @@ class RiskManager:
             actual_risk = round(size * sl_distance * spec.contract_size, 2)
             return RiskDecision(True, size, actual_risk, "OK (Fixed Size)")
 
+        base_target_risk_usd = balance * (self.risk_percent / 100.0)
         target_risk_usd = balance * (self.effective_risk_percent / 100.0)
         raw_size = target_risk_usd / (sl_distance * spec.contract_size)
 
@@ -185,15 +186,15 @@ class RiskManager:
 
         if size < spec.min_size:
             min_risk = spec.min_size * sl_distance * spec.contract_size
-            # Allow min_size only if it doesn't exceed 2x target risk
-            if min_risk <= target_risk_usd * 2.0:
+            # Allow min_size if base risk limit tolerates it (loss-streak scaling shouldn't lock out min_size=0.01)
+            if min_risk <= base_target_risk_usd * 2.0:
                 size = spec.min_size
             else:
                 return RiskDecision(
                     False,
                     0.0,
                     0.0,
-                    f"Balance quá nhỏ cho size tối thiểu {spec.min_size} (rủi ro ${min_risk:.2f} > 2x ${target_risk_usd:.2f})",
+                    f"Balance quá nhỏ cho size tối thiểu {spec.min_size} (rủi ro ${min_risk:.2f} > 2x ${base_target_risk_usd:.2f})",
                 )
 
         if self.max_size > 0 and size > self.max_size:
